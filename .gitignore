@@ -1,0 +1,27 @@
+# Node
+node_modules/
+dist/
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/
+
+# Claude Code internal
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local DB
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

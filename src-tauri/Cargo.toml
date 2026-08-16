@@ -1,0 +1,40 @@
+[package]
+name = "coding-plan-manager"
+version = "0.1.0"
+description = "Coding Plan 管理与聚合网关"
+edition = "2021"
+
+[lib]
+name = "coding_plan_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 注意：刻意禁用默认的 common-controls-v6 —— 它会静态导入仅存在于 comctl32 v6 的
+# TaskDialogIndirect，而 cargo 测试二进制没有 tauri-build 嵌入的 SxS manifest，
+# 会在启动时以 STATUS_ENTRYPOINT_NOT_FOUND 崩溃。正式 app 二进制同样工作正常。
+tauri = { version = "2", default-features = false, features = ["wry", "compression", "dynamic-acl", "x11", "dbus"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "system-proxy"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+futures-util = "0.3"
+rand = "0.8"
+chrono = "0.4"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
