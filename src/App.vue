@@ -23,6 +23,8 @@ import {
   ClusterOutlined,
   MessageOutlined,
 } from "@ant-design/icons-vue";
+import { Modal } from "ant-design-vue";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import PlansPage from "./pages/PlansPage.vue";
 import AggregatorsPage from "./pages/AggregatorsPage.vue";
 import MessagesPage from "./pages/MessagesPage.vue";
@@ -59,11 +61,26 @@ const stats = ref<UsageStats>({
 const refreshStats = () => globalStats().then((s) => (stats.value = s));
 
 let unlisten: (() => void) | null = null;
+let unlistenClose: (() => void) | null = null;
 onMounted(async () => {
   refreshStats();
   unlisten = await onNewMessage(() => refreshStats());
+  // 关闭窗口前弹出确认框；确认后用 destroy() 绕过 close-requested 真正退出
+  unlistenClose = await getCurrentWindow().onCloseRequested((event) => {
+    event.preventDefault();
+    Modal.confirm({
+      title: "确定要退出程序吗？",
+      content: "退出后将停止所有运行中的聚合器服务。",
+      okText: "退出",
+      cancelText: "取消",
+      onOk: () => getCurrentWindow().destroy(),
+    });
+  });
 });
-onUnmounted(() => unlisten?.());
+onUnmounted(() => {
+  unlisten?.();
+  unlistenClose?.();
+});
 </script>
 
 <style>
