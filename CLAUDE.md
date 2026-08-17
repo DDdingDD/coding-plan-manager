@@ -15,7 +15,7 @@ npm run build                            # 前端 vue-tsc 类型检查 + Vite �
 npm run tauri build                      # 打包桌面应用
 
 # Rust 测试（在仓库根目录执行；需 MSVC 工具链）
-cargo test --manifest-path src-tauri/Cargo.toml              # 全部：13 单测 + 5 e2e
+cargo test --manifest-path src-tauri/Cargo.toml              # 全部：21 单测 + 11 e2e
 cargo test --manifest-path src-tauri/Cargo.toml --lib        # 仅单元测试
 cargo test --manifest-path src-tauri/Cargo.toml --test e2e   # 仅端到端测试
 cargo test --manifest-path src-tauri/Cargo.toml --test e2e e2e_tcp_server_start_stop  # 单个测试
@@ -29,7 +29,7 @@ node scripts/mock-upstream.mjs 9401      # 本地模拟上游（Anthropic/OpenAI
 
 前端 `src/`（Vue 3 + ant-design-vue，三个页面），后端 `src-tauri/src/`。核心在 Rust 侧：
 
-- **请求转发主链路** `proxy/handler.rs`（兜底路由，任意 method/path）：校验聚合器令牌（Bearer/x-api-key 均可）→ `strategy.rs` 选计划 → reqwest 转发（剥跳段头/原鉴权头，注入所选计划的 AUTH_TOKEN 为 Bearer + x-api-key 双头）→ 响应回传（SSE 走 mpsc channel 流式透传并累积副本；JSON 整体回传）→ `usage.rs` 解析用量（OpenAI/Anthropic 的 JSON 与 SSE 格式，Anthropic message_start 的 usage 嵌套在 `message.usage`）→ 落库 + 累加绑定用量 + emit `message:new` 事件推前端。
+- **请求转发主链路** `proxy/handler.rs`（兜底路由，任意 method/path）：校验聚合器令牌（Bearer/x-api-key 均可）→ `strategy.rs` 选计划 → reqwest 转发（剥跳段头/原鉴权头，注入所选计划的 AUTH_TOKEN 为 Bearer + x-api-key 双头）→ 响应回传（SSE 走 mpsc channel 流式透传并累积副本；JSON 整体回传）→ `usage.rs` 解析用量（OpenAI/Anthropic 的 JSON 与 SSE 格式，Anthropic message_start 的 usage 嵌套在 `message.usage`；同时解析 prompt caching 的 `cache_read_input_tokens`/`cache_creation_input_tokens`，Anthropic 无显式 total 时按原始口径合计四项 input + cache_read + cache_creation + output，因此驱动轮转的绑定用量含缓存部分；OpenAI 的 `prompt_tokens_details.cached_tokens` 是 prompt 子集，刻意不解析以免重复计数）→ 落库 + 累加绑定用量 + emit `message:new` 事件推前端。
 - **阈值轮转** `proxy/strategy.rs`：按绑定顺序取第一个"启用且 used_tokens < token_threshold"的计划；**全部超额时清零所有绑定并回绕到第一个**（需求语义，勿改成 503）；仅"无任何启用计划"返回 503。
 - **服务生命周期** `proxy/mod.rs::start_server`：bind TcpListener → spawn axum（CancellationToken 优雅关停）。运行中的服务句柄存 `state.rs AppState.servers`（仅内存，应用重启后不自动恢复）。
 - **Tauri 命令层** `commands/`（plans/aggregators/messages）：thin wrapper，每个命令自行 `lock()` 拿连接。

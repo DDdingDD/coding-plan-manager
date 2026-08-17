@@ -5,12 +5,25 @@ use serde::Serialize;
 pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Anthropic prompt caching：命中缓存读取的输入 token（不含在 input_tokens 中）
+    pub cache_read_tokens: i64,
+    /// Anthropic prompt caching：本次新写入缓存的输入 token
+    pub cache_creation_tokens: i64,
     pub total_tokens: i64,
+}
+
+/// normalize_usage 从单个 usage 对象中解析出的可选字段
+struct RawUsage {
+    prompt: Option<i64>,
+    completion: Option<i64>,
+    total: Option<i64>,
+    cache_read: Option<i64>,
+    cache_creation: Option<i64>,
 }
 
 /// 兼容 OpenAI（prompt_tokens/completion_tokens/total_tokens）
 /// 与 Anthropic（input_tokens/output_tokens）两种 usage 格式
-fn normalize_usage(v: &serde_json::Value) -> (Option<i64>, Option<i64>, Option<i64>) {
+fn normalize_usage(v: &serde_json::Value) -> RawUsage {
     // OpenAI / Anthropic message_delta：usage 在顶层
     // Anthropic message_start：usage 嵌套在 message.usage
     let usage = v
@@ -18,7 +31,15 @@ fn normalize_usage(v: &serde_json::Value) -> (Option<i64>, Option<i64>, Option<i
         .or_else(|| v.get("message").and_then(|m| m.get("usage")));
     let usage = match usage {
         Some(u) if u.is_object() => u,
-        _ => return (None, None, None),
+        _ => {
+            return RawUsage {
+                prompt: None,
+                completion: None,
+                total: None,
+                cache_read: None,
+                cache_creation: None,
+            }
+        }
     };
     let prompt = usage
         .get("prompt_tokens")
@@ -29,28 +50,48 @@ fn normalize_usage(v: &serde_json::Value) -> (Option<i64>, Option<i64>, Option<i
         .or_else(|| usage.get("output_tokens"))
         .and_then(|x| x.as_i64());
     let total = usage.get("total_tokens").and_then(|x| x.as_i64());
-    (prompt, completion, total)
+    // Anthropic 的缓存字段是 input_tokens 之外的独立部分；
+    // OpenAI 的 prompt_tokens_details.cached_tokens 是 prompt_tokens 的子集（已含在 total 中），不解析以免重复计数
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|x| x.as_i64());
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|x| x.as_i64());
+    RawUsage {
+        prompt,
+        completion,
+        total,
+        cache_read,
+        cache_creation,
+    }
 }
 
 /// 解析非流式 JSON 响应体
 pub fn parse_json_usage(body: &str) -> Usage {
     let mut u = Usage::default();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        let (p, c, t) = normalize_usage(&v);
-        u.prompt_tokens = p.unwrap_or(0);
-        u.completion_tokens = c.unwrap_or(0);
-        u.total_tokens = t.unwrap_or(u.prompt_tokens + u.completion_tokens);
+        let r = normalize_usage(&v);
+        u.prompt_tokens = r.prompt.unwrap_or(0);
+        u.completion_tokens = r.completion.unwrap_or(0);
+        u.cache_read_tokens = r.cache_read.unwrap_or(0);
+        u.cache_creation_tokens = r.cache_creation.unwrap_or(0);
+        u.total_tokens = r
+            .total
+            .unwrap_or(u.prompt_tokens + u.completion_tokens + u.cache_read_tokens + u.cache_creation_tokens);
     }
     u
 }
 
 /// 解析 SSE 流文本：逐个解析 `data:` 行，后面的 usage 覆盖前面的
-/// （Anthropic 的 message_start 带 input_tokens，message_delta 持续更新 output_tokens；
+/// （Anthropic 的 message_start 带 input_tokens 与缓存字段，message_delta 持续更新 output_tokens；
 ///   OpenAI 在最后一个 chunk 带 usage）
 pub fn parse_sse_usage(body: &str) -> Usage {
     let mut prompt: Option<i64> = None;
     let mut completion: Option<i64> = None;
     let mut total: Option<i64> = None;
+    let mut cache_read: Option<i64> = None;
+    let mut cache_creation: Option<i64> = None;
 
     for line in body.lines() {
         let data = match line.strip_prefix("data:") {
@@ -61,25 +102,35 @@ pub fn parse_sse_usage(body: &str) -> Usage {
             continue;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-            let (p, c, t) = normalize_usage(&v);
-            if p.is_some() {
-                prompt = p;
+            let r = normalize_usage(&v);
+            if r.prompt.is_some() {
+                prompt = r.prompt;
             }
-            if c.is_some() {
-                completion = c;
+            if r.completion.is_some() {
+                completion = r.completion;
             }
-            if t.is_some() {
-                total = t;
+            if r.total.is_some() {
+                total = r.total;
+            }
+            if r.cache_read.is_some() {
+                cache_read = r.cache_read;
+            }
+            if r.cache_creation.is_some() {
+                cache_creation = r.cache_creation;
             }
         }
     }
 
     let prompt = prompt.unwrap_or(0);
     let completion = completion.unwrap_or(0);
+    let cache_read = cache_read.unwrap_or(0);
+    let cache_creation = cache_creation.unwrap_or(0);
     Usage {
         prompt_tokens: prompt,
         completion_tokens: completion,
-        total_tokens: total.unwrap_or(prompt + completion),
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
+        total_tokens: total.unwrap_or(prompt + completion + cache_read + cache_creation),
     }
 }
 
@@ -159,6 +210,18 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_json_with_cache() {
+        // prompt caching：input_tokens 不含缓存部分，total 需按原始口径合计四项
+        let body = r#"{"id":"msg","usage":{"input_tokens":1200,"cache_creation_input_tokens":8000,"cache_read_input_tokens":91000,"output_tokens":500}}"#;
+        let u = parse_json_usage(body);
+        assert_eq!(u.prompt_tokens, 1200);
+        assert_eq!(u.completion_tokens, 500);
+        assert_eq!(u.cache_creation_tokens, 8000);
+        assert_eq!(u.cache_read_tokens, 91000);
+        assert_eq!(u.total_tokens, 1200 + 8000 + 91000 + 500);
+    }
+
+    #[test]
     fn no_usage() {
         let u = parse_json_usage(r#"{"ok":true}"#);
         assert_eq!(u.total_tokens, 0);
@@ -184,6 +247,21 @@ data: {\"type\":\"message_stop\"}\n";
         assert_eq!(u.prompt_tokens, 100);
         assert_eq!(u.completion_tokens, 57);
         assert_eq!(u.total_tokens, 157);
+    }
+
+    #[test]
+    fn anthropic_sse_with_cache() {
+        // message_start 带缓存字段，message_delta 更新 output_tokens，total 合计四项
+        let body = "\
+data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1000,\"cache_read_input_tokens\":50000,\"cache_creation_input_tokens\":2000,\"output_tokens\":1}}}\n\
+\n\
+data: {\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":300}}\n";
+        let u = parse_sse_usage(body);
+        assert_eq!(u.prompt_tokens, 1000);
+        assert_eq!(u.completion_tokens, 300);
+        assert_eq!(u.cache_read_tokens, 50000);
+        assert_eq!(u.cache_creation_tokens, 2000);
+        assert_eq!(u.total_tokens, 1000 + 50000 + 2000 + 300);
     }
 
     #[test]

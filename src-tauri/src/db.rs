@@ -51,6 +51,8 @@ pub struct MessageRow {
     pub model: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
     pub total_tokens: i64,
     pub duration_ms: i64,
     pub created_at: String,
@@ -71,6 +73,8 @@ pub struct NewMessage {
     pub model: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
     pub total_tokens: i64,
     pub duration_ms: i64,
 }
@@ -80,6 +84,8 @@ pub struct UsageStats {
     pub total_tokens: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
     pub requests: i64,
 }
 
@@ -90,6 +96,8 @@ pub struct StatsBucket {
     pub total_tokens: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
     pub requests: i64,
 }
 
@@ -145,6 +153,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
             model             TEXT NOT NULL DEFAULT '',
             prompt_tokens     INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+            cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens      INTEGER NOT NULL DEFAULT 0,
             duration_ms       INTEGER NOT NULL DEFAULT 0,
             created_at        TEXT NOT NULL
@@ -159,13 +169,30 @@ pub fn init_db(path: &str) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 旧库增量迁移：为 messages 表补 model 列
+/// 旧库增量迁移：messages 表缺列则补（model / 缓存 token 两列）
 fn migrate(conn: &Connection) -> Result<()> {
-    let has_model: bool = conn
-        .prepare("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='model'")?
-        .query_row([], |row| row.get::<_, i64>(0))? != 0;
-    if !has_model {
+    let mut has: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('messages')")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for r in rows {
+            has.push(r?);
+        }
+    }
+    if !has.iter().any(|c| c == "model") {
         conn.execute("ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    if !has.iter().any(|c| c == "cache_read_tokens") {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has.iter().any(|c| c == "cache_creation_tokens") {
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -416,7 +443,8 @@ pub fn reset_binding_usage(conn: &Connection, aggregator_id: i64) -> Result<usiz
 fn stats_query(conn: &Connection, where_clause: &str, param: Option<i64>) -> Result<UsageStats> {
     let sql = format!(
         "SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0),
-                COALESCE(SUM(completion_tokens),0), COUNT(*)
+                COALESCE(SUM(completion_tokens),0), COALESCE(SUM(cache_read_tokens),0),
+                COALESCE(SUM(cache_creation_tokens),0), COUNT(*)
          FROM messages {where_clause}"
     );
     let read = |row: &rusqlite::Row| -> Result<UsageStats> {
@@ -424,7 +452,9 @@ fn stats_query(conn: &Connection, where_clause: &str, param: Option<i64>) -> Res
             total_tokens: row.get(0)?,
             prompt_tokens: row.get(1)?,
             completion_tokens: row.get(2)?,
-            requests: row.get(3)?,
+            cache_read_tokens: row.get(3)?,
+            cache_creation_tokens: row.get(4)?,
+            requests: row.get(5)?,
         })
     };
     match param {
@@ -455,7 +485,9 @@ fn row_to_bucket(row: &rusqlite::Row) -> Result<StatsBucket> {
         total_tokens: row.get(1)?,
         prompt_tokens: row.get(2)?,
         completion_tokens: row.get(3)?,
-        requests: row.get(4)?,
+        cache_read_tokens: row.get(4)?,
+        cache_creation_tokens: row.get(5)?,
+        requests: row.get(6)?,
     })
 }
 
@@ -470,7 +502,8 @@ fn bucket_query(
 ) -> Result<Vec<StatsBucket>> {
     let sql = format!(
         "SELECT {key_sql} AS k, COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0), \
-         COALESCE(SUM(completion_tokens),0), COUNT(*) \
+         COALESCE(SUM(completion_tokens),0), COALESCE(SUM(cache_read_tokens),0), \
+         COALESCE(SUM(cache_creation_tokens),0), COUNT(*) \
          FROM messages {where_clause} GROUP BY k ORDER BY {ordering}"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -557,7 +590,8 @@ pub fn stats_by_model(
 
 const MSG_COLS: &str = "m.id, m.aggregator_id, m.plan_id, m.method, m.path, m.status, \
                         m.request_body, m.response_body, m.model, m.prompt_tokens, \
-                        m.completion_tokens, m.total_tokens, m.duration_ms, m.created_at, \
+                        m.completion_tokens, m.cache_read_tokens, m.cache_creation_tokens, \
+                        m.total_tokens, m.duration_ms, m.created_at, \
                         a.name, p.name";
 
 fn row_to_message(row: &rusqlite::Row) -> Result<MessageRow> {
@@ -573,11 +607,13 @@ fn row_to_message(row: &rusqlite::Row) -> Result<MessageRow> {
         model: row.get(8)?,
         prompt_tokens: row.get(9)?,
         completion_tokens: row.get(10)?,
-        total_tokens: row.get(11)?,
-        duration_ms: row.get(12)?,
-        created_at: row.get(13)?,
-        aggregator_name: row.get(14)?,
-        plan_name: row.get(15)?,
+        cache_read_tokens: row.get(11)?,
+        cache_creation_tokens: row.get(12)?,
+        total_tokens: row.get(13)?,
+        duration_ms: row.get(14)?,
+        created_at: row.get(15)?,
+        aggregator_name: row.get(16)?,
+        plan_name: row.get(17)?,
     })
 }
 
@@ -585,8 +621,9 @@ pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages (aggregator_id, plan_id, method, path, status, request_body,
                                response_body, model, prompt_tokens, completion_tokens,
+                               cache_read_tokens, cache_creation_tokens,
                                total_tokens, duration_ms, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             msg.aggregator_id,
             msg.plan_id,
@@ -598,6 +635,8 @@ pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.model,
             msg.prompt_tokens,
             msg.completion_tokens,
+            msg.cache_read_tokens,
+            msg.cache_creation_tokens,
             msg.total_tokens,
             msg.duration_ms,
             now_str()
@@ -740,7 +779,9 @@ mod tests {
                     model: "claude-sonnet-5".into(),
                     prompt_tokens: 10,
                     completion_tokens: 5,
-                    total_tokens: 15,
+                    cache_read_tokens: 40,
+                    cache_creation_tokens: 20,
+                    total_tokens: 75,
                     duration_ms: 3,
                 },
             )
@@ -755,14 +796,38 @@ mod tests {
 
         let s = aggregator_stats(&conn, agg.id).unwrap();
         assert_eq!(s.requests, 5);
-        assert_eq!(s.total_tokens, 75);
+        assert_eq!(s.total_tokens, 375);
+        assert_eq!(s.cache_read_tokens, 200);
+        assert_eq!(s.cache_creation_tokens, 100);
         let s = plan_stats(&conn, p1.id).unwrap();
-        assert_eq!(s.total_tokens, 75);
+        assert_eq!(s.total_tokens, 375);
         let s = global_stats(&conn).unwrap();
-        assert_eq!(s.total_tokens, 75);
+        assert_eq!(s.total_tokens, 375);
 
         assert_eq!(clear_messages(&conn, Some(agg.id)).unwrap(), 5);
         assert_eq!(global_stats(&conn).unwrap().requests, 0);
+    }
+
+    #[test]
+    fn delete_cascades_bindings() {
+        let conn = mem();
+        let p1 = create_plan(&conn, "p1", "https://a", "t1", "").unwrap();
+        let p2 = create_plan(&conn, "p2", "https://b", "t2", "").unwrap();
+        let agg1 = create_aggregator(&conn, "g1", 8300, "cpm-1", 100).unwrap();
+        let agg2 = create_aggregator(&conn, "g2", 8301, "cpm-2", 100).unwrap();
+
+        // 删除计划：其在所有聚合器下的绑定一并解除
+        set_aggregator_plans(&conn, agg1.id, &[p1.id, p2.id]).unwrap();
+        set_aggregator_plans(&conn, agg2.id, &[p1.id]).unwrap();
+        assert_eq!(delete_plan(&conn, p1.id).unwrap(), 1);
+        assert_eq!(list_bindings(&conn, agg1.id).unwrap().len(), 1, "agg1 应只剩 p2");
+        assert!(list_bindings(&conn, agg2.id).unwrap().is_empty(), "agg2 绑定应全部解除");
+
+        // 删除聚合器：其下绑定解除，其他聚合器不受影响
+        set_aggregator_plans(&conn, agg1.id, &[p2.id]).unwrap();
+        assert_eq!(delete_aggregator(&conn, agg2.id).unwrap(), 1);
+        assert!(list_bindings(&conn, agg2.id).unwrap().is_empty());
+        assert_eq!(list_bindings(&conn, agg1.id).unwrap().len(), 1, "agg1 的绑定不应受影响");
     }
 
     #[test]
@@ -784,6 +849,8 @@ mod tests {
                     model: model.into(),
                     prompt_tokens: prompt,
                     completion_tokens: completion,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
                     total_tokens: prompt + completion,
                     duration_ms: 1,
                 },
@@ -853,6 +920,17 @@ mod tests {
         .unwrap();
         migrate(&old).unwrap();
         migrate(&old).unwrap(); // 幂等
+        let mut cols: Vec<String> = Vec::new();
+        {
+            let mut stmt = old.prepare("SELECT name FROM pragma_table_info('messages')").unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+            for r in rows {
+                cols.push(r.unwrap());
+            }
+        }
+        for c in ["model", "cache_read_tokens", "cache_creation_tokens"] {
+            assert!(cols.iter().any(|x| x == c), "迁移后应有列 {c}");
+        }
         old.execute(
             "INSERT INTO messages (aggregator_id, created_at) VALUES (1, '2026-08-17 10:00:00')",
             [],

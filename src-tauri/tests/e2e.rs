@@ -22,6 +22,12 @@ enum MockMode {
     Json,
     /// Anthropic SSE：input 30 / output 最终 9
     Sse,
+    /// Anthropic JSON + prompt caching：input 50 / cache_read 900 / cache_creation 40 / output 10
+    CacheJson,
+    /// 固定错误：429 + Anthropic 风格错误体
+    Error,
+    /// 回显：JSON 返回收到的 method/uri/headers，用于断言头透传与方法保真
+    Echo,
 }
 
 /// 启动 mock 上游，返回 (base_url, 收到的鉴权头记录)
@@ -33,6 +39,17 @@ async fn spawn_mock_upstream(mode: MockMode) -> (String, Arc<Mutex<Vec<String>>>
         axum::Router::new().fallback(move |req: Request| {
             let captured = captured.clone();
             async move {
+                let method = req.method().as_str().to_string();
+                let uri = req
+                    .uri()
+                    .path_and_query()
+                    .map(|p| p.as_str().to_string())
+                    .unwrap_or_default();
+                let header_pairs: Vec<(String, String)> = req
+                    .headers()
+                    .iter()
+                    .map(|(n, v)| (n.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
                 let auth = req
                     .headers()
                     .get("authorization")
@@ -48,12 +65,14 @@ async fn spawn_mock_upstream(mode: MockMode) -> (String, Arc<Mutex<Vec<String>>>
                 captured.lock().unwrap().push(format!("{auth}|{api_key}"));
                 let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
 
-                let (ct, body) = match mode {
+                let (status, ct, body) = match mode {
                     MockMode::Json => (
+                        200,
                         "application/json",
                         r#"{"id":"m1","usage":{"input_tokens":50,"output_tokens":10}}"#.to_string(),
                     ),
                     MockMode::Sse => (
+                        200,
                         "text/event-stream",
                         concat!(
                             "event: message_start\n",
@@ -65,9 +84,31 @@ async fn spawn_mock_upstream(mode: MockMode) -> (String, Arc<Mutex<Vec<String>>>
                         )
                         .to_string(),
                     ),
+                    MockMode::CacheJson => (
+                        200,
+                        "application/json",
+                        r#"{"id":"m1","usage":{"input_tokens":50,"cache_read_input_tokens":900,"cache_creation_input_tokens":40,"output_tokens":10}}"#.to_string(),
+                    ),
+                    MockMode::Error => (
+                        429,
+                        "application/json",
+                        r#"{"type":"error","error":{"type":"rate_limit_error","message":"超出速率限制"}}"#.to_string(),
+                    ),
+                    MockMode::Echo => {
+                        let mut headers = serde_json::Map::new();
+                        for (n, v) in &header_pairs {
+                            headers.insert(n.clone(), serde_json::Value::String(v.clone()));
+                        }
+                        (
+                            200,
+                            "application/json",
+                            serde_json::json!({"method": method, "uri": uri, "headers": headers})
+                                .to_string(),
+                        )
+                    }
                 };
                 Response::builder()
-                    .status(200)
+                    .status(status)
                     .header("content-type", ct)
                     .body(Body::from(body))
                     .unwrap()
@@ -92,14 +133,29 @@ fn lock(db: &Conn) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
 }
 
 async fn send(router: &axum::Router, token: &str) -> (u16, String) {
-    let req = Request::builder()
-        .method("POST")
-        .uri("/v1/messages?beta=true")
-        .header("authorization", format!("Bearer {token}"))
-        .header("content-type", "application/json")
-        .header("anthropic-version", "2023-06-01")
-        .body(Body::from(r#"{"model":"claude-x","stream":false}"#))
-        .unwrap();
+    send_raw(
+        router,
+        "POST",
+        "/v1/messages?beta=true",
+        &[("authorization", format!("Bearer {token}"))],
+        r#"{"model":"claude-x","stream":false}"#,
+    )
+    .await
+}
+
+/// 以指定 method/uri/头/体构造请求并 oneshot 驱动代理
+async fn send_raw(
+    router: &axum::Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, String)],
+    body: &str,
+) -> (u16, String) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, value.as_str());
+    }
+    let req = builder.body(Body::from(body.to_string())).unwrap();
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -119,6 +175,35 @@ async fn wait_for_messages(conn: &Conn, agg_id: i64, min: i64) {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     panic!("消息未在预期时间内落库");
+}
+
+/// 初始化内存库 + 聚合器（按 plan_tokens 顺序绑定各计划），返回 (连接, 路由, 聚合器 id)
+async fn setup_router(
+    upstream: &str,
+    plan_tokens: &[&str],
+    port: i64,
+    agg_token: &str,
+    threshold: i64,
+) -> (Conn, axum::Router, i64) {
+    let conn: Conn = Arc::new(Mutex::new(db::init_db(":memory:").unwrap()));
+    let agg_id = {
+        let c = lock(&conn);
+        let plan_ids: Vec<i64> = plan_tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| db::create_plan(&c, &format!("P{i}"), upstream, t, "").unwrap().id)
+            .collect();
+        let agg = db::create_aggregator(&c, "g", port, agg_token, threshold).unwrap();
+        db::set_aggregator_plans(&c, agg.id, &plan_ids).unwrap();
+        agg.id
+    };
+    let shared = Arc::new(ProxyShared {
+        aggregator_id: agg_id,
+        db: conn.clone(),
+        client: reqwest::Client::new(),
+        app: None,
+    });
+    (conn, proxy::build_router(shared), agg_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -349,4 +434,171 @@ async fn e2e_tcp_server_start_stop() {
         .send()
         .await;
     assert!(closed.is_err(), "停止服务后端口应不再接受连接");
+}
+
+/// x-api-key 鉴权：正确令牌放行，错误令牌 401（Claude Code 实际使用该头）
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_x_api_key_auth() {
+    let (upstream, captured) = spawn_mock_upstream(MockMode::Json).await;
+    let (_conn, router, _) = setup_router(&upstream, &["tokK"], 8306, "cpm-key", 1000).await;
+
+    // 正确 x-api-key -> 200
+    let (status, body) = send_raw(
+        &router,
+        "POST",
+        "/v1/messages",
+        &[("x-api-key", "cpm-key".to_string())],
+        r#"{"model":"claude-x"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "x-api-key 鉴权应放行: {body}");
+
+    // 上游收到的是计划的令牌（客户端原始 x-api-key 不透传）
+    assert_eq!(captured.lock().unwrap()[0], "Bearer tokK|tokK");
+
+    // 错误 x-api-key -> 401
+    let (status, body) = send_raw(
+        &router,
+        "POST",
+        "/v1/messages",
+        &[("x-api-key", "wrong".to_string())],
+        r#"{"model":"claude-x"}"#,
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert!(body.contains("authentication_error"));
+}
+
+/// 上游返回非 200（429）：状态码与错误体应原样透传，消息以该状态落库
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_upstream_error_status_passthrough() {
+    let (upstream, _captured) = spawn_mock_upstream(MockMode::Error).await;
+    let (conn, router, agg_id) = setup_router(&upstream, &["tokE"], 8307, "cpm-err", 1000).await;
+
+    let (status, body) = send(&router, "cpm-err").await;
+    assert_eq!(status, 429, "上游状态码应透传");
+    assert!(body.contains("rate_limit_error"), "上游错误体应透传: {body}");
+
+    // 非流式分支落库在响应返回前完成
+    let c = lock(&conn);
+    let (_, items) = db::list_messages(&c, Some(agg_id), 5, 0).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].status, 429);
+    assert!(items[0].response_body.contains("rate_limit_error"));
+    assert_eq!(items[0].total_tokens, 0, "错误响应无 usage，不计 token");
+}
+
+/// 业务头透传 + 跳段/鉴权头剥离：anthropic-* 等透传到上游，
+/// 原始 authorization/x-api-key/host/accept-encoding 不透传，替换为计划令牌
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_header_passthrough_and_strip() {
+    let (upstream, _captured) = spawn_mock_upstream(MockMode::Echo).await;
+    let (_conn, router, _) = setup_router(&upstream, &["tokH"], 8308, "cpm-hdr", 1000).await;
+
+    let (status, body) = send_raw(
+        &router,
+        "POST",
+        "/v1/messages?beta=true",
+        &[
+            ("authorization", "Bearer cpm-hdr".to_string()),
+            ("x-api-key", "cpm-hdr".to_string()),
+            ("anthropic-version", "2023-06-01".to_string()),
+            ("anthropic-beta", "context-1m-2025-08-07".to_string()),
+            ("x-custom-header", "keep-me".to_string()),
+            ("accept-encoding", "gzip".to_string()),
+            ("host", "evil.example".to_string()),
+        ],
+        r#"{"model":"claude-x"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "转发应成功: {body}");
+
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["method"], "POST");
+    assert_eq!(v["uri"], "/v1/messages?beta=true", "path 与 query 应保真");
+    let h = &v["headers"];
+
+    // 业务头透传
+    assert_eq!(h["anthropic-version"], "2023-06-01");
+    assert_eq!(h["anthropic-beta"], "context-1m-2025-08-07");
+    assert_eq!(h["x-custom-header"], "keep-me");
+
+    // 鉴权头替换为计划的 AUTH_TOKEN（Bearer + x-api-key 双头）
+    assert_eq!(h["authorization"], "Bearer tokH");
+    assert_eq!(h["x-api-key"], "tokH");
+
+    // 跳段头/编码协商头剥离
+    assert!(h.get("accept-encoding").is_none(), "accept-encoding 应被剥离: {h}");
+    assert_ne!(h["host"], "evil.example", "客户端原始 host 不应透传");
+}
+
+/// GET 等无 body 方法：透明转发，方法与路径保真
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_get_no_body() {
+    let (upstream, _captured) = spawn_mock_upstream(MockMode::Echo).await;
+    let (_conn, router, _) = setup_router(&upstream, &["tokG"], 8309, "cpm-get", 1000).await;
+
+    let (status, body) = send_raw(
+        &router,
+        "GET",
+        "/v1/models?limit=10",
+        &[("authorization", "Bearer cpm-get".to_string())],
+        "",
+    )
+    .await;
+    assert_eq!(status, 200, "GET 请求应转发成功: {body}");
+
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["method"], "GET");
+    assert_eq!(v["uri"], "/v1/models?limit=10");
+}
+
+/// 配置热更新：运行中的服务修改 token_threshold 即时生效，无需重启
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_threshold_hot_reload() {
+    let (upstream, captured) = spawn_mock_upstream(MockMode::Json).await;
+    let (conn, router, agg_id) = setup_router(&upstream, &["tokA", "tokB"], 8310, "cpm-hot", 100).await;
+
+    // 请求 1：阈值 100，A 从 0 起步 -> 选 A（用后 60）
+    let (status, _) = send(&router, "cpm-hot").await;
+    assert_eq!(status, 200);
+    assert_eq!(captured.lock().unwrap()[0], "Bearer tokA|tokA");
+
+    // 热更新：阈值降到 60，A 已用 60 -> 下一请求应切到 B（服务未重启）
+    {
+        let c = lock(&conn);
+        db::update_aggregator(&c, agg_id, "g", 8310, 60).unwrap();
+    }
+    let (status, _) = send(&router, "cpm-hot").await;
+    assert_eq!(status, 200);
+    assert_eq!(captured.lock().unwrap()[1], "Bearer tokB|tokB", "阈值修改应即时生效");
+}
+
+/// prompt caching：cache_read/cache_creation 解析入库并计入 total（原始 token 口径）与绑定用量
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cache_tokens_counted() {
+    let (upstream, _captured) = spawn_mock_upstream(MockMode::CacheJson).await;
+    let (conn, router, agg_id) = setup_router(&upstream, &["tokC"], 8311, "cpm-cache", 1000).await;
+
+    let (status, body) = send(&router, "cpm-cache").await;
+    assert_eq!(status, 200, "转发应成功: {body}");
+
+    // 非流式分支落库在响应返回前完成
+    let c = lock(&conn);
+    let (_, items) = db::list_messages(&c, Some(agg_id), 5, 0).unwrap();
+    let m = &items[0];
+    assert_eq!(m.prompt_tokens, 50, "input_tokens 不含缓存部分");
+    assert_eq!(m.cache_read_tokens, 900);
+    assert_eq!(m.cache_creation_tokens, 40);
+    assert_eq!(m.total_tokens, 50 + 900 + 40 + 10, "total 应按原始口径合计四项");
+
+    // 绑定用量（轮转计数）同样按含缓存的 total 累加
+    let bindings = db::list_bindings(&c, agg_id).unwrap();
+    assert_eq!(bindings[0].used_tokens, 1000, "绑定用量应含缓存 token");
+
+    // 统计聚合带出缓存字段
+    let s = db::aggregator_stats(&c, agg_id).unwrap();
+    assert_eq!(s.cache_read_tokens, 900);
+    assert_eq!(s.cache_creation_tokens, 40);
+    assert_eq!(s.total_tokens, 1000);
 }

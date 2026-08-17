@@ -11,6 +11,11 @@
               :style="{ height: `${(b.promptValue / b.value) * 100}%` }"
             />
             <div
+              v-if="b.cacheValue > 0"
+              class="bar-seg cache"
+              :style="{ height: `${(b.cacheValue / b.value) * 100}%` }"
+            />
+            <div
               v-if="b.completionValue > 0"
               class="bar-seg completion"
               :style="{ height: `${(b.completionValue / b.value) * 100}%` }"
@@ -30,12 +35,13 @@
 <script setup lang="ts">
 import { computed } from "vue";
 
-/** 单根柱：label 为横轴文案，value 为主值（决定高度），promptValue/completionValue 拆分为输入/输出两段 */
+/** 单根柱：label 为横轴文案，value 为主值（决定高度），promptValue/cacheValue/completionValue 拆分为输入/缓存读/输出三段 */
 export interface BarItem {
   label: string;
   tooltip: string;
   value: number;
   promptValue: number;
+  cacheValue: number;
   completionValue: number;
 }
 
@@ -92,11 +98,17 @@ export default { name: "TokenBars" };
 .bar-seg.prompt {
   background: #1677ff;
 }
+.bar-seg.cache {
+  background: #95de64;
+}
 .bar-seg.completion {
   background: #69b1ff;
 }
 .bar-col:hover .bar-seg.prompt {
   background: #0958d9;
+}
+.bar-col:hover .bar-seg.cache {
+  background: #73d13d;
 }
 .bar-col:hover .bar-seg.completion {
   background: #4096ff;

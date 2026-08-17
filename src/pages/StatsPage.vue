@@ -26,6 +26,7 @@
       <TokenBars :bars="dailyBars" :height="220" />
       <div class="legend">
         <span><i class="dot prompt" /> 输入 Token</span>
+        <span><i class="dot cache" /> 缓存读</span>
         <span><i class="dot completion" /> 输出 Token</span>
       </div>
     </a-card>
@@ -37,6 +38,7 @@
       <TokenBars :bars="hourlyBars" :height="220" />
       <div class="legend">
         <span><i class="dot prompt" /> 输入 Token</span>
+        <span><i class="dot cache" /> 缓存读</span>
         <span><i class="dot completion" /> 输出 Token</span>
       </div>
     </a-card>
@@ -70,6 +72,15 @@
           </template>
           <template v-else-if="column.key === 'completion'">
             {{ formatNumber(record.completion_tokens) }}
+          </template>
+          <template v-else-if="column.key === 'cache'">
+            {{ formatNumber(record.cache_read_tokens) }}
+            <span
+              v-if="record.cache_creation_tokens > 0"
+              style="color: #999; font-size: 12px"
+            >
+              （写 {{ formatNumber(record.cache_creation_tokens) }}）
+            </span>
           </template>
           <template v-else-if="column.key === 'share'">
             <a-progress
@@ -116,14 +127,17 @@ const dailyBars = computed<BarItem[]>(() => {
     const b = byKey.get(d);
     const prompt = b?.prompt_tokens ?? 0;
     const completion = b?.completion_tokens ?? 0;
+    const cacheRead = b?.cache_read_tokens ?? 0;
+    const cacheCreation = b?.cache_creation_tokens ?? 0;
     const total = b?.total_tokens ?? 0;
     const dateLabel = d.slice(5); // MM-DD
     return {
       label: dateLabel,
       value: total,
       promptValue: prompt,
+      cacheValue: cacheRead,
       completionValue: completion,
-      tooltip: `${d}｜总量 ${formatNumber(total)}（入 ${formatNumber(prompt)} / 出 ${formatNumber(completion)}）｜${b?.requests ?? 0} 次请求`,
+      tooltip: `${d}｜总量 ${formatNumber(total)}（入 ${formatNumber(prompt)} / 缓存读 ${formatNumber(cacheRead)} / 缓存写 ${formatNumber(cacheCreation)} / 出 ${formatNumber(completion)}）｜${b?.requests ?? 0} 次请求`,
     };
   });
 });
@@ -147,13 +161,16 @@ const hourlyBars = computed<BarItem[]>(() => {
     const b = byKey.get(key);
     const prompt = b?.prompt_tokens ?? 0;
     const completion = b?.completion_tokens ?? 0;
+    const cacheRead = b?.cache_read_tokens ?? 0;
+    const cacheCreation = b?.cache_creation_tokens ?? 0;
     const total = b?.total_tokens ?? 0;
     return {
       label: key,
       value: total,
       promptValue: prompt,
+      cacheValue: cacheRead,
       completionValue: completion,
-      tooltip: `${key}:00-${key}:59｜总量 ${formatNumber(total)}（入 ${formatNumber(prompt)} / 出 ${formatNumber(completion)}）｜${b?.requests ?? 0} 次请求`,
+      tooltip: `${key}:00-${key}:59｜总量 ${formatNumber(total)}（入 ${formatNumber(prompt)} / 缓存读 ${formatNumber(cacheRead)} / 缓存写 ${formatNumber(cacheCreation)} / 出 ${formatNumber(completion)}）｜${b?.requests ?? 0} 次请求`,
     };
   });
 });
@@ -178,6 +195,7 @@ const modelColumns = [
   { title: "模型", key: "model" },
   { title: "总 Token", key: "total", width: 140 },
   { title: "输入", key: "prompt", width: 120 },
+  { title: "缓存读", key: "cache", width: 150 },
   { title: "输出", key: "completion", width: 120 },
   { title: "请求数", dataIndex: "requests", key: "requests", width: 90 },
   { title: "占比", key: "share", width: 220 },
@@ -237,6 +255,9 @@ onUnmounted(() => unlisten?.());
 }
 .dot.prompt {
   background: #1677ff;
+}
+.dot.cache {
+  background: #95de64;
 }
 .dot.completion {
   background: #69b1ff;

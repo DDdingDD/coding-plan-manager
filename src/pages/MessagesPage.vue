@@ -45,6 +45,9 @@
           <span style="color: #999; font-size: 12px">
             (入 {{ formatNumber(record.prompt_tokens) }} / 出 {{ formatNumber(record.completion_tokens) }})
           </span>
+          <div v-if="record.cache_read_tokens > 0 || record.cache_creation_tokens > 0" style="color: #95de64; font-size: 12px">
+            缓存 读 {{ formatNumber(record.cache_read_tokens) }} / 写 {{ formatNumber(record.cache_creation_tokens) }}
+          </div>
         </template>
         <template v-else-if="column.key === 'req'">
           <span style="font-family: monospace; font-size: 12px">
@@ -79,9 +82,13 @@
           <a-descriptions-item label="模型" :span="2">
             {{ detail.model || "（未知）" }}
           </a-descriptions-item>
-          <a-descriptions-item label="Token">
+          <a-descriptions-item label="Token" :span="2">
             总 {{ formatNumber(detail.total_tokens) }}｜入 {{ formatNumber(detail.prompt_tokens) }}｜出
             {{ formatNumber(detail.completion_tokens) }}
+            <span v-if="detail.cache_read_tokens > 0 || detail.cache_creation_tokens > 0" style="color: #389e0d">
+              ｜缓存读 {{ formatNumber(detail.cache_read_tokens) }}｜缓存写
+              {{ formatNumber(detail.cache_creation_tokens) }}
+            </span>
           </a-descriptions-item>
           <a-descriptions-item label="耗时">{{ detail.duration_ms }} ms</a-descriptions-item>
         </a-descriptions>

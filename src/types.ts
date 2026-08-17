@@ -4,6 +4,8 @@ export interface UsageStats {
   total_tokens: number;
   prompt_tokens: number;
   completion_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
   requests: number;
 }
 
@@ -13,6 +15,8 @@ export interface StatsBucket {
   total_tokens: number;
   prompt_tokens: number;
   completion_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
   requests: number;
 }
 
@@ -70,6 +74,8 @@ export interface MessageRow {
   model: string;
   prompt_tokens: number;
   completion_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
   total_tokens: number;
   duration_ms: number;
   created_at: string;

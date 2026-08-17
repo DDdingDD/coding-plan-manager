@@ -457,6 +457,8 @@ async fn store_message(
             model,
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
+            cache_read_tokens: u.cache_read_tokens,
+            cache_creation_tokens: u.cache_creation_tokens,
             total_tokens: u.total_tokens,
             duration_ms,
         };
@@ -473,5 +475,48 @@ async fn store_message(
             use tauri::Emitter;
             let _ = app.emit("message:new", &record);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_store_short_untouched() {
+        assert_eq!(cap_store("hello"), "hello");
+        assert_eq!(cap_store(""), "");
+    }
+
+    #[test]
+    fn cap_store_truncates_multibyte_on_boundary() {
+        // 多字节字符（"汉" 3 字节）铺满超过 2MB，截断点必然落在字符中间
+        let s = "汉".repeat(MAX_STORED_BODY / 3 + 10);
+        assert!(s.len() > MAX_STORED_BODY);
+        let out = cap_store(&s);
+        // 截断处回退到字符边界，不 panic、不产生非法切片
+        assert!(out.len() < s.len());
+        assert!(out.ends_with("\n…[已截断]"), "应带截断标记");
+        let body = out.strip_suffix("\n…[已截断]").unwrap();
+        assert!(
+            body.chars().all(|c| c == '汉'),
+            "截断不应撕裂多字节字符"
+        );
+    }
+
+    #[test]
+    fn truncate_char_safe_keeps_boundary() {
+        // "abc汉" 字节长 6，limit 5 落在 "汉" 的中间 -> 应回退到 "abc"
+        let mut s = "abc汉".to_string();
+        truncate_char_safe(&mut s, 5);
+        assert_eq!(s, "abc");
+
+        let mut s = "abc".to_string();
+        truncate_char_safe(&mut s, 100);
+        assert_eq!(s, "abc", "limit 超长时原样保留");
     }
 }
