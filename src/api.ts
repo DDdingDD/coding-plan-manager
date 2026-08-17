@@ -132,9 +132,12 @@ export const hourlyStats = (p: { aggregatorId?: number | null; date?: string } =
     date: p.date ?? null,
   });
 
-/** 按模型统计 */
-export const modelStats = (p: { aggregatorId?: number | null } = {}) =>
-  invoke<StatsBucket[]>("model_stats", { aggregatorId: p.aggregatorId ?? null });
+/** 按模型统计（days 缺省为全部时间） */
+export const modelStats = (p: { aggregatorId?: number | null; days?: number | null } = {}) =>
+  invoke<StatsBucket[]>("model_stats", {
+    aggregatorId: p.aggregatorId ?? null,
+    days: p.days ?? null,
+  });
 
 // ---------------------------------------------------------------------------
 // 事件订阅

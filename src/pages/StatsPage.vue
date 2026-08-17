@@ -42,6 +42,14 @@
     </a-card>
 
     <a-card title="按模型统计" size="small">
+      <template #extra>
+        <a-radio-group v-model:value="modelDays" size="small" @change="loadModels">
+          <a-radio-button :value="0">全部</a-radio-button>
+          <a-radio-button :value="7">近 7 天</a-radio-button>
+          <a-radio-button :value="14">近 14 天</a-radio-button>
+          <a-radio-button :value="30">近 30 天</a-radio-button>
+        </a-radio-group>
+      </template>
       <a-table
         :columns="modelColumns"
         :data-source="modelRows"
@@ -163,6 +171,8 @@ async function loadHourly() {
 
 // ---- 按模型 ----
 const models = ref<StatsBucket[]>([]);
+/** 时间段：0 = 全部时间，>0 = 近 N 天 */
+const modelDays = ref(0);
 
 const modelColumns = [
   { title: "模型", key: "model" },
@@ -184,7 +194,10 @@ const modelRows = computed(() =>
 
 async function loadModels() {
   try {
-    models.value = await modelStats({ aggregatorId: filterAgg.value });
+    models.value = await modelStats({
+      aggregatorId: filterAgg.value,
+      days: modelDays.value > 0 ? modelDays.value : null,
+    });
   } catch (e) {
     message.error(String(e));
   }

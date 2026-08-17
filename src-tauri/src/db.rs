@@ -517,19 +517,38 @@ pub fn stats_hourly(conn: &Connection, aggregator_id: Option<i64>, date: &str) -
     )
 }
 
-/// 按模型统计：按总 token 倒序
-pub fn stats_by_model(conn: &Connection, aggregator_id: Option<i64>) -> Result<Vec<StatsBucket>> {
-    let (where_clause, param) = match aggregator_id {
-        Some(id) => ("WHERE aggregator_id=?1".to_string(), Some(id)),
-        None => (String::new(), None),
-    };
-    bucket_query(
-        conn,
-        "model",
-        &where_clause,
-        "COALESCE(SUM(total_tokens),0) DESC, k",
-        param,
-    )
+/// 按模型统计：按总 token 倒序；days 为 Some 时仅统计近 days 天（含今天）
+pub fn stats_by_model(
+    conn: &Connection,
+    aggregator_id: Option<i64>,
+    days: Option<i64>,
+) -> Result<Vec<StatsBucket>> {
+    let cutoff = days.map(|d| {
+        (chrono::Local::now() - chrono::Duration::days(d - 1))
+            .format("%Y-%m-%d")
+            .to_string()
+    });
+    let mut where_clause = String::new();
+    let mut params: Vec<i64> = Vec::new();
+    if let Some(id) = aggregator_id {
+        params.push(id);
+        where_clause.push_str(&format!("WHERE aggregator_id=?{} ", params.len()));
+    }
+    if let Some(c) = cutoff {
+        if where_clause.is_empty() {
+            where_clause.push_str("WHERE ");
+        } else {
+            where_clause.push_str("AND ");
+        }
+        where_clause.push_str(&format!("substr(created_at,1,10)>=('{c}')"));
+    }
+    bucket_query(conn, "model", &where_clause, "COALESCE(SUM(total_tokens),0) DESC, k", {
+        // 参数个数由是否带聚合器过滤决定
+        match params.len() {
+            1 => Some(params[0]),
+            _ => None,
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -805,12 +824,17 @@ mod tests {
         assert_eq!(hours[2].total_tokens, 300);
 
         // 按模型：按总量倒序，glm-4.7（含 cutoff 外的 1000）在前
-        let models = stats_by_model(&conn, None).unwrap();
+        let models = stats_by_model(&conn, None, None).unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].key, "glm-4.7");
         assert_eq!(models[0].total_tokens, 150 + 300 + 1000);
         assert_eq!(models[1].key, "claude-sonnet-5");
         assert_eq!(models[1].requests, 1);
+
+        // 按模型 + 近 1 天：cutoff 外的 1000 不计入
+        let models = stats_by_model(&conn, None, Some(1)).unwrap();
+        assert_eq!(models[0].key, "glm-4.7");
+        assert_eq!(models[0].total_tokens, 150 + 300);
 
         // 聚合器过滤（其他聚合器 id 应为空）
         assert!(stats_daily(&conn, Some(agg.id + 100), 1).unwrap().is_empty());
@@ -834,7 +858,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let buckets = stats_by_model(&old, None).unwrap();
+        let buckets = stats_by_model(&old, None, None).unwrap();
         assert_eq!(buckets[0].key, ""); // 旧行 model 为空串
     }
 }

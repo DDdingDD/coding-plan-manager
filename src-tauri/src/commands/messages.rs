@@ -87,12 +87,14 @@ pub fn hourly_stats(
     db::stats_hourly(&conn, aggregator_id, &date).map_err(e2s)
 }
 
-/// 按模型统计
+/// 按模型统计（days 缺省为全部时间）
 #[tauri::command]
 pub fn model_stats(
     state: tauri::State<'_, AppState>,
     aggregator_id: Option<i64>,
+    days: Option<i64>,
 ) -> Result<Vec<StatsBucket>, String> {
+    let days = days.map(|d| d.clamp(1, 365));
     let conn = lock(&state);
-    db::stats_by_model(&conn, aggregator_id).map_err(e2s)
+    db::stats_by_model(&conn, aggregator_id, days).map_err(e2s)
 }
