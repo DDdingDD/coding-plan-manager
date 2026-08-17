@@ -76,6 +76,9 @@
           <a-descriptions-item label="请求" :span="2">
             <span style="font-family: monospace">{{ detail.method }} {{ detail.path }}</span>
           </a-descriptions-item>
+          <a-descriptions-item label="模型" :span="2">
+            {{ detail.model || "（未知）" }}
+          </a-descriptions-item>
           <a-descriptions-item label="Token">
             总 {{ formatNumber(detail.total_tokens) }}｜入 {{ formatNumber(detail.prompt_tokens) }}｜出
             {{ formatNumber(detail.completion_tokens) }}
@@ -113,6 +116,7 @@ const columns = [
   { title: "时间", dataIndex: "created_at", key: "created_at", width: 160 },
   { title: "聚合器", dataIndex: "aggregator_name", key: "aggregator_name", width: 110 },
   { title: "计划", dataIndex: "plan_name", key: "plan_name", width: 110 },
+  { title: "模型", dataIndex: "model", key: "model", width: 150, ellipsis: true },
   { title: "请求", key: "req", ellipsis: true },
   { title: "状态", key: "status", width: 80 },
   { title: "Token", key: "tokens", width: 220 },

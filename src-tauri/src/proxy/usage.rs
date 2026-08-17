@@ -95,6 +95,43 @@ pub fn parse_usage(content_type: &str, body: &str) -> Usage {
     }
 }
 
+/// 从 JSON 文本顶层提取 "model" 字段（SSE 文本逐行尝试 data: 行）
+fn model_from_text(body: &str) -> Option<String> {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
+            return Some(m.to_string());
+        }
+    }
+    // SSE：Anthropic message_start 的 model 嵌套在 message.model，逐行找顶层/嵌套 model
+    for line in body.lines() {
+        let data = match line.strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+            if let Some(m) = v
+                .get("model")
+                .or_else(|| v.get("message").and_then(|m| m.get("model")))
+                .and_then(|m| m.as_str())
+            {
+                return Some(m.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 提取模型名：优先请求体的 "model"（Anthropic/OpenAI 请求均携带），
+/// 回退响应体（非流式 JSON 顶层或 SSE 的 message_start）
+pub fn extract_model(req_body: &str, resp_body: &str) -> String {
+    model_from_text(req_body)
+        .or_else(|| model_from_text(resp_body))
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -170,5 +207,21 @@ data: [DONE]\n";
         assert_eq!(parse_usage("application/json", sse).total_tokens, 0); // SSE 文本不是合法整体 JSON
         assert_eq!(parse_usage("application/json", "{}").total_tokens, 0);
         assert_eq!(parse_usage("text/event-stream", "").total_tokens, 0);
+    }
+
+    #[test]
+    fn model_extraction() {
+        // 请求体优先
+        assert_eq!(
+            extract_model(r#"{"model":"glm-4.7","messages":[]}"#, r#"{"model":"other"}"#),
+            "glm-4.7"
+        );
+        // 回退响应体（JSON 顶层）
+        assert_eq!(extract_model("", r#"{"model":"claude-sonnet-5"}"#), "claude-sonnet-5");
+        // 回退响应体（SSE message_start 嵌套）
+        let sse = "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-haiku-4.5\"}}";
+        assert_eq!(extract_model("", sse), "claude-haiku-4.5");
+        // 都没有
+        assert_eq!(extract_model("", ""), "");
     }
 }

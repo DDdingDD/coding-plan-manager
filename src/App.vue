@@ -11,7 +11,8 @@
     <a-layout-content style="padding: 16px; overflow: auto">
       <PlansPage v-if="current[0] === 'plans'" />
       <AggregatorsPage v-else-if="current[0] === 'aggregators'" />
-      <MessagesPage v-else />
+      <MessagesPage v-else-if="current[0] === 'messages'" />
+      <StatsPage v-else />
     </a-layout-content>
   </a-layout>
 </template>
@@ -20,6 +21,7 @@
 import { h, onMounted, onUnmounted, ref, type Component } from "vue";
 import {
   ApiOutlined,
+  BarChartOutlined,
   ClusterOutlined,
   MessageOutlined,
 } from "@ant-design/icons-vue";
@@ -28,6 +30,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import PlansPage from "./pages/PlansPage.vue";
 import AggregatorsPage from "./pages/AggregatorsPage.vue";
 import MessagesPage from "./pages/MessagesPage.vue";
+import StatsPage from "./pages/StatsPage.vue";
 import { globalStats, onNewMessage } from "./api";
 import type { UsageStats } from "./types";
 
@@ -48,6 +51,11 @@ const menuItems = [
     key: "messages",
     icon: () => h(MessageOutlined),
     label: "消息记录",
+  },
+  {
+    key: "stats",
+    icon: () => h(BarChartOutlined),
+    label: "统计",
   },
 ];
 

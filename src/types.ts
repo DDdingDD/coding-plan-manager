@@ -7,6 +7,15 @@ export interface UsageStats {
   requests: number;
 }
 
+/** 分组统计的一个桶（key 为日期、小时或模型名） */
+export interface StatsBucket {
+  key: string;
+  total_tokens: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  requests: number;
+}
+
 export interface CodingPlan {
   id: number;
   name: string;
@@ -58,6 +67,7 @@ export interface MessageRow {
   status: number;
   request_body: string;
   response_body: string;
+  model: string;
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;

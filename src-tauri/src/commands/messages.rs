@@ -1,4 +1,4 @@
-use crate::db::{self, MessageRow, UsageStats};
+use crate::db::{self, MessageRow, StatsBucket, UsageStats};
 use crate::state::AppState;
 use serde::Serialize;
 
@@ -61,4 +61,38 @@ pub fn clear_messages(
 pub fn global_stats(state: tauri::State<'_, AppState>) -> Result<UsageStats, String> {
     let conn = lock(&state);
     db::global_stats(&conn).map_err(e2s)
+}
+
+/// 按天统计（近 days 天，缺省 30）
+#[tauri::command]
+pub fn daily_stats(
+    state: tauri::State<'_, AppState>,
+    aggregator_id: Option<i64>,
+    days: Option<i64>,
+) -> Result<Vec<StatsBucket>, String> {
+    let days = days.unwrap_or(30).clamp(1, 365);
+    let conn = lock(&state);
+    db::stats_daily(&conn, aggregator_id, days).map_err(e2s)
+}
+
+/// 按小时统计（date 为 "YYYY-MM-DD"，缺省今天）
+#[tauri::command]
+pub fn hourly_stats(
+    state: tauri::State<'_, AppState>,
+    aggregator_id: Option<i64>,
+    date: Option<String>,
+) -> Result<Vec<StatsBucket>, String> {
+    let date = date.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
+    let conn = lock(&state);
+    db::stats_hourly(&conn, aggregator_id, &date).map_err(e2s)
+}
+
+/// 按模型统计
+#[tauri::command]
+pub fn model_stats(
+    state: tauri::State<'_, AppState>,
+    aggregator_id: Option<i64>,
+) -> Result<Vec<StatsBucket>, String> {
+    let conn = lock(&state);
+    db::stats_by_model(&conn, aggregator_id).map_err(e2s)
 }

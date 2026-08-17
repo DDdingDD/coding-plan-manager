@@ -38,6 +38,9 @@ pub fn run() {
             commands::messages::get_message,
             commands::messages::clear_messages,
             commands::messages::global_stats,
+            commands::messages::daily_stats,
+            commands::messages::hourly_stats,
+            commands::messages::model_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

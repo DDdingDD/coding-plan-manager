@@ -92,6 +92,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
             401,
             "",
             "鉴权失败：无效的 AUTH_TOKEN",
+            String::new(),
             &usage::Usage::default(),
             started,
         )
@@ -134,6 +135,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
                 503,
                 &req_body_stored,
                 "没有可用的 Coding Plan（未绑定或已全部禁用）",
+                usage::extract_model(&req_body_stored, ""),
                 &usage::Usage::default(),
                 started,
             )
@@ -203,6 +205,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
                 502,
                 &req_body_stored,
                 &msg,
+                usage::extract_model(&req_body_stored, ""),
                 &usage::Usage::default(),
                 started,
             )
@@ -282,6 +285,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
             } else {
                 collected
             };
+            let model = usage::extract_model(&req_stored, &resp_stored);
             store_message(
                 &shared2,
                 agg_id,
@@ -292,6 +296,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
                 status_code,
                 &req_stored,
                 &resp_stored,
+                model,
                 &u,
                 started,
             )
@@ -331,6 +336,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
                 502,
                 &req_body_stored,
                 &err,
+                usage::extract_model(&req_body_stored, ""),
                 &usage::Usage::default(),
                 started,
             )
@@ -341,6 +347,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
         let text = String::from_utf8_lossy(&full).to_string();
         let u = usage::parse_usage(&content_type, &text);
         let resp_stored = cap_store(&text);
+        let model = usage::extract_model(&req_body_stored, &text);
         store_message(
             &shared,
             agg_id,
@@ -351,6 +358,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
             status_code,
             &req_body_stored,
             &resp_stored,
+            model,
             &u,
             started,
         )
@@ -426,6 +434,7 @@ async fn store_message(
     status: i64,
     request_body: &str,
     response_body: &str,
+    model: String,
     u: &usage::Usage,
     started: Instant,
 ) {
@@ -445,6 +454,7 @@ async fn store_message(
             status,
             request_body: request_body.to_string(),
             response_body: response_body.to_string(),
+            model,
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,

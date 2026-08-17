@@ -5,6 +5,7 @@ import type {
   MessagePage,
   MessageRow,
   PlanView,
+  StatsBucket,
   UsageStats,
 } from "./types";
 
@@ -116,6 +117,24 @@ export const clearMessages = (aggregatorId?: number | null) =>
   invoke<number>("clear_messages", { aggregatorId: aggregatorId ?? null });
 
 export const globalStats = () => invoke<UsageStats>("global_stats");
+
+/** 按天统计（近 days 天） */
+export const dailyStats = (p: { aggregatorId?: number | null; days?: number } = {}) =>
+  invoke<StatsBucket[]>("daily_stats", {
+    aggregatorId: p.aggregatorId ?? null,
+    days: p.days ?? 30,
+  });
+
+/** 按小时统计（date 为 YYYY-MM-DD，缺省今天） */
+export const hourlyStats = (p: { aggregatorId?: number | null; date?: string } = {}) =>
+  invoke<StatsBucket[]>("hourly_stats", {
+    aggregatorId: p.aggregatorId ?? null,
+    date: p.date ?? null,
+  });
+
+/** 按模型统计 */
+export const modelStats = (p: { aggregatorId?: number | null } = {}) =>
+  invoke<StatsBucket[]>("model_stats", { aggregatorId: p.aggregatorId ?? null });
 
 // ---------------------------------------------------------------------------
 // 事件订阅

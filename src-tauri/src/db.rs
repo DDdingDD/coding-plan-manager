@@ -48,6 +48,7 @@ pub struct MessageRow {
     pub status: i64,
     pub request_body: String,
     pub response_body: String,
+    pub model: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
@@ -67,6 +68,7 @@ pub struct NewMessage {
     pub status: i64,
     pub request_body: String,
     pub response_body: String,
+    pub model: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
@@ -75,6 +77,16 @@ pub struct NewMessage {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageStats {
+    pub total_tokens: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub requests: i64,
+}
+
+/// 分组统计的一个桶（按天 / 按小时 / 按模型），key 为日期、小时或模型名
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsBucket {
+    pub key: String,
     pub total_tokens: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -130,6 +142,7 @@ pub fn init_db(path: &str) -> Result<Connection> {
             status            INTEGER NOT NULL DEFAULT 0,
             request_body      TEXT NOT NULL DEFAULT '',
             response_body     TEXT NOT NULL DEFAULT '',
+            model             TEXT NOT NULL DEFAULT '',
             prompt_tokens     INTEGER NOT NULL DEFAULT 0,
             completion_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens      INTEGER NOT NULL DEFAULT 0,
@@ -142,7 +155,19 @@ pub fn init_db(path: &str) -> Result<Connection> {
         CREATE INDEX IF NOT EXISTS idx_agg_plans_agg  ON aggregator_plans(aggregator_id);
         ",
     )?;
+    migrate(&conn)?;
     Ok(conn)
+}
+
+/// 旧库增量迁移：为 messages 表补 model 列
+fn migrate(conn: &Connection) -> Result<()> {
+    let has_model: bool = conn
+        .prepare("SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='model'")?
+        .query_row([], |row| row.get::<_, i64>(0))? != 0;
+    if !has_model {
+        conn.execute("ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    Ok(())
 }
 
 pub fn now_str() -> String {
@@ -421,12 +446,99 @@ pub fn global_stats(conn: &Connection) -> Result<UsageStats> {
 }
 
 // ---------------------------------------------------------------------------
+// 分组统计（按天 / 按小时 / 按模型）
+// ---------------------------------------------------------------------------
+
+fn row_to_bucket(row: &rusqlite::Row) -> Result<StatsBucket> {
+    Ok(StatsBucket {
+        key: row.get(0)?,
+        total_tokens: row.get(1)?,
+        prompt_tokens: row.get(2)?,
+        completion_tokens: row.get(3)?,
+        requests: row.get(4)?,
+    })
+}
+
+/// 通用分组统计：key_sql 为分组表达式（天/小时/模型），可选聚合器过滤。
+/// ordering 为 ORDER BY 表达式（小时/模型分组与 key 顺序不同）。
+fn bucket_query(
+    conn: &Connection,
+    key_sql: &str,
+    where_clause: &str,
+    ordering: &str,
+    param: Option<i64>,
+) -> Result<Vec<StatsBucket>> {
+    let sql = format!(
+        "SELECT {key_sql} AS k, COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0), \
+         COALESCE(SUM(completion_tokens),0), COUNT(*) \
+         FROM messages {where_clause} GROUP BY k ORDER BY {ordering}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = match param {
+        Some(v) => stmt.query_map(params![v], row_to_bucket)?.collect::<Result<Vec<_>>>()?,
+        None => stmt.query_map([], row_to_bucket)?.collect::<Result<Vec<_>>>()?,
+    };
+    Ok(rows)
+}
+
+/// 按天统计：最近 days 天（含今天），created_at 为本地时间 "YYYY-MM-DD HH:MM:SS"
+pub fn stats_daily(conn: &Connection, aggregator_id: Option<i64>, days: i64) -> Result<Vec<StatsBucket>> {
+    let cutoff = (chrono::Local::now() - chrono::Duration::days(days - 1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let (where_clause, param) = match aggregator_id {
+        Some(id) => (format!("WHERE aggregator_id=?1 AND substr(created_at,1,10)>=('{cutoff}')"), Some(id)),
+        None => (format!("WHERE substr(created_at,1,10)>=('{cutoff}')"), None),
+    };
+    bucket_query(
+        conn,
+        "substr(created_at,1,10)",
+        &where_clause,
+        "k",
+        param,
+    )
+}
+
+/// 按小时统计：指定日期（"YYYY-MM-DD"）内 0-23 点各小时用量
+pub fn stats_hourly(conn: &Connection, aggregator_id: Option<i64>, date: &str) -> Result<Vec<StatsBucket>> {
+    let (where_clause, param) = match aggregator_id {
+        Some(id) => (
+            format!("WHERE aggregator_id=?1 AND substr(created_at,1,10)=('{date}')"),
+            Some(id),
+        ),
+        None => (format!("WHERE substr(created_at,1,10)=('{date}')"), None),
+    };
+    bucket_query(
+        conn,
+        "substr(created_at,12,2)",
+        &where_clause,
+        "CAST(k AS INTEGER)",
+        param,
+    )
+}
+
+/// 按模型统计：按总 token 倒序
+pub fn stats_by_model(conn: &Connection, aggregator_id: Option<i64>) -> Result<Vec<StatsBucket>> {
+    let (where_clause, param) = match aggregator_id {
+        Some(id) => ("WHERE aggregator_id=?1".to_string(), Some(id)),
+        None => (String::new(), None),
+    };
+    bucket_query(
+        conn,
+        "model",
+        &where_clause,
+        "COALESCE(SUM(total_tokens),0) DESC, k",
+        param,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // 消息
 // ---------------------------------------------------------------------------
 
 const MSG_COLS: &str = "m.id, m.aggregator_id, m.plan_id, m.method, m.path, m.status, \
-                        m.request_body, m.response_body, m.prompt_tokens, m.completion_tokens, \
-                        m.total_tokens, m.duration_ms, m.created_at, \
+                        m.request_body, m.response_body, m.model, m.prompt_tokens, \
+                        m.completion_tokens, m.total_tokens, m.duration_ms, m.created_at, \
                         a.name, p.name";
 
 fn row_to_message(row: &rusqlite::Row) -> Result<MessageRow> {
@@ -439,22 +551,23 @@ fn row_to_message(row: &rusqlite::Row) -> Result<MessageRow> {
         status: row.get(5)?,
         request_body: row.get(6)?,
         response_body: row.get(7)?,
-        prompt_tokens: row.get(8)?,
-        completion_tokens: row.get(9)?,
-        total_tokens: row.get(10)?,
-        duration_ms: row.get(11)?,
-        created_at: row.get(12)?,
-        aggregator_name: row.get(13)?,
-        plan_name: row.get(14)?,
+        model: row.get(8)?,
+        prompt_tokens: row.get(9)?,
+        completion_tokens: row.get(10)?,
+        total_tokens: row.get(11)?,
+        duration_ms: row.get(12)?,
+        created_at: row.get(13)?,
+        aggregator_name: row.get(14)?,
+        plan_name: row.get(15)?,
     })
 }
 
 pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages (aggregator_id, plan_id, method, path, status, request_body,
-                               response_body, prompt_tokens, completion_tokens, total_tokens,
-                               duration_ms, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                               response_body, model, prompt_tokens, completion_tokens,
+                               total_tokens, duration_ms, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
         params![
             msg.aggregator_id,
             msg.plan_id,
@@ -463,6 +576,7 @@ pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.status,
             msg.request_body,
             msg.response_body,
+            msg.model,
             msg.prompt_tokens,
             msg.completion_tokens,
             msg.total_tokens,
@@ -604,6 +718,7 @@ mod tests {
                     status: 200,
                     request_body: "req".into(),
                     response_body: "resp".into(),
+                    model: "claude-sonnet-5".into(),
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     total_tokens: 15,
@@ -629,5 +744,97 @@ mod tests {
 
         assert_eq!(clear_messages(&conn, Some(agg.id)).unwrap(), 5);
         assert_eq!(global_stats(&conn).unwrap().requests, 0);
+    }
+
+    #[test]
+    fn grouped_stats_and_migration() {
+        let conn = mem();
+        let p1 = create_plan(&conn, "p1", "https://a", "t1", "").unwrap();
+        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100).unwrap();
+        // NewMessage 不含 created_at（落库固定用 now_str），插入后用 SQL 改写时间
+        let mk = |model: &str, created: &str, prompt: i64, completion: i64| {
+            (
+                NewMessage {
+                    aggregator_id: agg.id,
+                    plan_id: Some(p1.id),
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    status: 200,
+                    request_body: "req".into(),
+                    response_body: "resp".into(),
+                    model: model.into(),
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_tokens: prompt + completion,
+                    duration_ms: 1,
+                },
+                created.to_string(),
+            )
+        };
+        let insert_at = |m: NewMessage, created: String| {
+            insert_message(&conn, &m).unwrap();
+            conn.execute(
+                "UPDATE messages SET created_at=?1 WHERE id=(SELECT MAX(id) FROM messages)",
+                params![created],
+            )
+            .unwrap();
+        };
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let (m, c) = mk("glm-4.7", &format!("{today} 09:30:00"), 100, 50);
+        insert_at(m, c);
+        let (m, c) = mk("glm-4.7", &format!("{today} 21:05:00"), 200, 100);
+        insert_at(m, c);
+        let (m, c) = mk("claude-sonnet-5", &format!("{today} 14:00:00"), 10, 5);
+        insert_at(m, c);
+        let (m, c) = mk("glm-4.7", "2001-01-01 08:00:00", 999, 1); // 超出时间范围
+        insert_at(m, c);
+
+        // 按天：cutoff 之外的不计入
+        let days = stats_daily(&conn, None, 1).unwrap();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].key, today);
+        assert_eq!(days[0].total_tokens, 100 + 50 + 200 + 100 + 10 + 5);
+        assert_eq!(days[0].requests, 3);
+
+        // 按小时：09 点与 21 点
+        let hours = stats_hourly(&conn, None, &today).unwrap();
+        assert_eq!(hours.len(), 3);
+        assert_eq!(hours[0].key, "09");
+        assert_eq!(hours[0].total_tokens, 150);
+        assert_eq!(hours[2].key, "21");
+        assert_eq!(hours[2].total_tokens, 300);
+
+        // 按模型：按总量倒序，glm-4.7（含 cutoff 外的 1000）在前
+        let models = stats_by_model(&conn, None).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].key, "glm-4.7");
+        assert_eq!(models[0].total_tokens, 150 + 300 + 1000);
+        assert_eq!(models[1].key, "claude-sonnet-5");
+        assert_eq!(models[1].requests, 1);
+
+        // 聚合器过滤（其他聚合器 id 应为空）
+        assert!(stats_daily(&conn, Some(agg.id + 100), 1).unwrap().is_empty());
+
+        // 迁移：旧库（无 model 列）打开后自动补列
+        let old = Connection::open_in_memory().unwrap();
+        old.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, aggregator_id INTEGER NOT NULL,
+                plan_id INTEGER, method TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
+                status INTEGER NOT NULL DEFAULT 0, request_body TEXT NOT NULL DEFAULT '',
+                response_body TEXT NOT NULL DEFAULT '', prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        migrate(&old).unwrap();
+        migrate(&old).unwrap(); // 幂等
+        old.execute(
+            "INSERT INTO messages (aggregator_id, created_at) VALUES (1, '2026-08-17 10:00:00')",
+            [],
+        )
+        .unwrap();
+        let buckets = stats_by_model(&old, None).unwrap();
+        assert_eq!(buckets[0].key, ""); // 旧行 model 为空串
     }
 }
