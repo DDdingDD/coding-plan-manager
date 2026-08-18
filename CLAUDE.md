@@ -15,7 +15,7 @@ npm run build                            # 前端 vue-tsc 类型检查 + Vite �
 npm run tauri build                      # 打包桌面应用
 
 # Rust 测试（在仓库根目录执行；需 MSVC 工具链）
-cargo test --manifest-path src-tauri/Cargo.toml              # 全部：25 单测 + 11 e2e
+cargo test --manifest-path src-tauri/Cargo.toml              # 全部：27 单测 + 11 e2e
 cargo test --manifest-path src-tauri/Cargo.toml --lib        # 仅单元测试
 cargo test --manifest-path src-tauri/Cargo.toml --test e2e   # 仅端到端测试
 cargo test --manifest-path src-tauri/Cargo.toml --test e2e e2e_tcp_server_start_stop  # 单个测试
@@ -32,7 +32,7 @@ node scripts/mock-upstream.mjs 9401      # 本地模拟上游（Anthropic/OpenAI
 - **请求转发主链路** `proxy/handler.rs`（兜底路由，任意 method/path）：校验聚合器令牌（Bearer/x-api-key 均可）→ `strategy.rs` 选计划 → reqwest 转发（剥跳段头/原鉴权头，注入所选计划的 AUTH_TOKEN 为 Bearer + x-api-key 双头）→ 响应回传（SSE 走 mpsc channel 流式透传并累积副本；JSON 整体回传）→ `usage.rs` 解析用量（OpenAI/Anthropic 的 JSON 与 SSE 格式，Anthropic message_start 的 usage 嵌套在 `message.usage`；SSE 用量由 `SseUsageTracker` 在转发途中按行增量解析、不依赖 2MB 落库截断副本——否则流尾部的 message_delta/最终 chunk 丢失会少计 output_tokens；同时解析 prompt caching 的 `cache_read_input_tokens`/`cache_creation_input_tokens`，Anthropic 无显式 total 时按原始口径合计四项 input + cache_read + cache_creation + output，因此驱动轮转的绑定用量含缓存部分；OpenAI 的 `prompt_tokens_details.cached_tokens` 是 prompt 子集，刻意不解析以免重复计数）→ 落库 + 累加绑定用量 + emit `message:new` 事件推前端。
 - **阈值轮转** `proxy/strategy.rs`：按绑定顺序取第一个"启用且 used_tokens < token_threshold"的计划；**全部超额时清零所有绑定并回绕到第一个**（需求语义，勿改成 503）；仅"无任何启用计划"返回 503。
 - **服务生命周期** `proxy/mod.rs::start_server`：bind TcpListener → spawn axum（CancellationToken 优雅关停）。运行中的服务句柄存 `state.rs AppState.servers`（仅内存，应用重启后不自动恢复）。
-- **Tauri 命令层** `commands/`（plans/aggregators/messages）：thin wrapper，每个命令自行 `lock()` 拿连接；统计查询命令（global/daily/hourly/model_stats）在 messages.rs。
+- **Tauri 命令层** `commands/`（plans/aggregators/messages）：thin wrapper，每个命令自行 `lock()` 拿连接；统计查询命令（global/daily/hourly/model_stats）在 messages.rs。`list_messages` 返回不含请求/响应体的 `MessageSummary`（两个 body 各上限 2MB，列表页不展示、不值得搬运；详情走 `get_message` 拉全量 `MessageRow`）。新建聚合器自动分配端口时跳过 DB 已占用端口（`resolve_create_port`，服务未运行时 bind 测不出冲突）。
 - **系统托盘** `tray.rs`：左键单击/菜单恢复主窗口；关闭窗口默认隐藏到托盘，侧边栏开关可改为退出确认（偏好存 localStorage，逻辑在 `App.vue`）。
 - **单连接模型**：整个应用共享一个 `Arc<Mutex<rusqlite::Connection>>`（commands 与代理服务共用）。handler **每次请求从 DB 重读聚合器配置**，因此阈值/令牌修改即时生效，无需重启服务；仅改端口要求先停止。
 

@@ -79,6 +79,29 @@ pub struct NewMessage {
     pub duration_ms: i64,
 }
 
+/// 消息列表行：不含请求/响应体两个大字段（各上限 2MB），
+/// 列表/分页查询专用；完整消息经 get_message 拉取
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageSummary {
+    pub id: i64,
+    pub aggregator_id: i64,
+    pub plan_id: Option<i64>,
+    pub method: String,
+    pub path: String,
+    pub status: i64,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub total_tokens: i64,
+    pub duration_ms: i64,
+    pub created_at: String,
+    /// 冗余的关联名称，便于前端直接展示
+    pub aggregator_name: Option<String>,
+    pub plan_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UsageStats {
     pub total_tokens: i64,
@@ -162,6 +185,9 @@ pub fn init_db(path: &str) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_messages_agg   ON messages(aggregator_id, id DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_plan  ON messages(plan_id);
+        -- 按天/按小时统计以 substr(created_at,1,10) 过滤与分组，
+        -- 表达式索引须与查询中的表达式完全一致才能命中
+        CREATE INDEX IF NOT EXISTS idx_messages_date  ON messages(substr(created_at,1,10));
         CREATE INDEX IF NOT EXISTS idx_agg_plans_agg  ON aggregator_plans(aggregator_id);
         ",
     )?;
@@ -422,18 +448,18 @@ pub fn set_aggregator_plans(conn: &Connection, aggregator_id: i64, plan_ids: &[i
 
 /// 累加绑定用量，返回影响行数（0 表示绑定已不存在，如转发途中被重新绑定）
 pub fn add_binding_usage(conn: &Connection, binding_id: i64, tokens: i64) -> Result<usize> {
-    Ok(conn.execute(
+    conn.execute(
         "UPDATE aggregator_plans SET used_tokens = used_tokens + ?2 WHERE id=?1",
         params![binding_id, tokens],
-    )?)
+    )
 }
 
 /// 将聚合器下所有绑定的已用 token 清零
 pub fn reset_binding_usage(conn: &Connection, aggregator_id: i64) -> Result<usize> {
-    Ok(conn.execute(
+    conn.execute(
         "UPDATE aggregator_plans SET used_tokens=0 WHERE aggregator_id=?1",
         params![aggregator_id],
-    )?)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +646,34 @@ fn row_to_message(row: &rusqlite::Row) -> Result<MessageRow> {
     })
 }
 
+/// 列表查询的列集：不含 request_body/response_body（各上限 2MB，
+/// 列表页不展示，搬运它们只会白白撑大 IPC 负载）
+const MSG_SUMMARY_COLS: &str = "m.id, m.aggregator_id, m.plan_id, m.method, m.path, m.status, \
+                                m.model, m.prompt_tokens, m.completion_tokens, \
+                                m.cache_read_tokens, m.cache_creation_tokens, m.total_tokens, \
+                                m.duration_ms, m.created_at, a.name, p.name";
+
+fn row_to_summary(row: &rusqlite::Row) -> Result<MessageSummary> {
+    Ok(MessageSummary {
+        id: row.get(0)?,
+        aggregator_id: row.get(1)?,
+        plan_id: row.get(2)?,
+        method: row.get(3)?,
+        path: row.get(4)?,
+        status: row.get(5)?,
+        model: row.get(6)?,
+        prompt_tokens: row.get(7)?,
+        completion_tokens: row.get(8)?,
+        cache_read_tokens: row.get(9)?,
+        cache_creation_tokens: row.get(10)?,
+        total_tokens: row.get(11)?,
+        duration_ms: row.get(12)?,
+        created_at: row.get(13)?,
+        aggregator_name: row.get(14)?,
+        plan_name: row.get(15)?,
+    })
+}
+
 pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<i64> {
     conn.execute(
         "INSERT INTO messages (aggregator_id, plan_id, method, path, status, request_body,
@@ -658,18 +712,18 @@ pub fn get_message(conn: &Connection, id: i64) -> Result<Option<MessageRow>> {
     conn.query_row(&sql, params![id], row_to_message).optional()
 }
 
-/// 分页列出消息（按 id 倒序），返回 (总数, 本页数据)
+/// 分页列出消息（按 id 倒序，不含请求/响应体），返回 (总数, 本页数据)
 pub fn list_messages(
     conn: &Connection,
     aggregator_id: Option<i64>,
     limit: i64,
     offset: i64,
-) -> Result<(i64, Vec<MessageRow>)> {
+) -> Result<(i64, Vec<MessageSummary>)> {
     let (count_sql, list_sql) = match aggregator_id {
         Some(_agg_id) => (
             "SELECT COUNT(*) FROM messages WHERE aggregator_id=?1".to_string(),
             format!(
-                "SELECT {MSG_COLS} FROM messages m
+                "SELECT {MSG_SUMMARY_COLS} FROM messages m
                  LEFT JOIN aggregators a ON a.id = m.aggregator_id
                  LEFT JOIN coding_plans p ON p.id = m.plan_id
                  WHERE m.aggregator_id=?1 ORDER BY m.id DESC LIMIT ?2 OFFSET ?3"
@@ -678,7 +732,7 @@ pub fn list_messages(
         None => (
             "SELECT COUNT(*) FROM messages".to_string(),
             format!(
-                "SELECT {MSG_COLS} FROM messages m
+                "SELECT {MSG_SUMMARY_COLS} FROM messages m
                  LEFT JOIN aggregators a ON a.id = m.aggregator_id
                  LEFT JOIN coding_plans p ON p.id = m.plan_id
                  ORDER BY m.id DESC LIMIT ?2 OFFSET ?3"
@@ -694,7 +748,7 @@ pub fn list_messages(
     let mut stmt = conn.prepare(&list_sql)?;
     let rows = stmt.query_map(
         params![aggregator_id, limit, offset],
-        row_to_message,
+        row_to_summary,
     )?;
     let items = rows.collect::<Result<Vec<_>>>()?;
     Ok((total, items))
@@ -723,13 +777,13 @@ mod tests {
     fn plan_crud() {
         let conn = mem();
         let p = create_plan(&conn, "p1", "https://a.example", "tok1", "r").unwrap();
-        assert_eq!(p.enabled, true);
+        assert!(p.enabled);
         let got = get_plan(&conn, p.id).unwrap().unwrap();
         assert_eq!(got.name, "p1");
         update_plan(&conn, p.id, "p1x", "https://b.example", "tok2", "r2", false).unwrap();
         let got = get_plan(&conn, p.id).unwrap().unwrap();
         assert_eq!(got.name, "p1x");
-        assert_eq!(got.enabled, false);
+        assert!(!got.enabled);
         assert_eq!(delete_plan(&conn, p.id).unwrap(), 1);
         assert!(get_plan(&conn, p.id).unwrap().is_none());
     }

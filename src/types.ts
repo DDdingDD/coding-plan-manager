@@ -83,9 +83,29 @@ export interface MessageRow {
   plan_name: string | null;
 }
 
+/** 消息列表行（不含请求/响应体两个大字段；详情用 getMessage 拉取完整 MessageRow） */
+export interface MessageSummary {
+  id: number;
+  aggregator_id: number;
+  plan_id: number | null;
+  method: string;
+  path: string;
+  status: number;
+  model: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  total_tokens: number;
+  duration_ms: number;
+  created_at: string;
+  aggregator_name: string | null;
+  plan_name: string | null;
+}
+
 export interface MessagePage {
   total: number;
   page: number;
   page_size: number;
-  items: MessageRow[];
+  items: MessageSummary[];
 }

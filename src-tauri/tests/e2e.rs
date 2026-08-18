@@ -490,13 +490,15 @@ async fn e2e_upstream_error_status_passthrough() {
     assert_eq!(status, 429, "上游状态码应透传");
     assert!(body.contains("rate_limit_error"), "上游错误体应透传: {body}");
 
-    // 非流式分支落库在响应返回前完成
+    // 非流式分支落库在响应返回前完成；列表行不含体，完整消息经 get_message 拉取
     let c = lock(&conn);
-    let (_, items) = db::list_messages(&c, Some(agg_id), 5, 0).unwrap();
+    let (total, items) = db::list_messages(&c, Some(agg_id), 5, 0).unwrap();
+    assert_eq!(total, 1);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].status, 429);
-    assert!(items[0].response_body.contains("rate_limit_error"));
-    assert_eq!(items[0].total_tokens, 0, "错误响应无 usage，不计 token");
+    let m = db::get_message(&c, items[0].id).unwrap().unwrap();
+    assert!(m.response_body.contains("rate_limit_error"));
+    assert_eq!(m.total_tokens, 0, "错误响应无 usage，不计 token");
 }
 
 /// 业务头透传 + 跳段/鉴权头剥离：anthropic-* 等透传到上游，

@@ -2,7 +2,7 @@ use crate::db::{self, Aggregator, UsageStats};
 use crate::proxy;
 use crate::state::{AppState, RunningServer};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Clone)]
@@ -88,14 +88,27 @@ pub fn list_aggregators(state: tauri::State<'_, AppState>) -> Result<Vec<Aggrega
 // 增删改
 // ---------------------------------------------------------------------------
 
-/// 在 8300..=8399 中寻找可用端口
-fn find_free_port() -> Option<i64> {
-    for p in 8300i64..=8399 {
-        if std::net::TcpListener::bind(("127.0.0.1", p as u16)).is_ok() {
-            return Some(p);
+/// 解析创建端口：显式端口校验范围与唯一性；自动分配则在 8300..=8399 中
+/// 跳过已占用端口后再做 bind 测试（taken 来自数据库——服务未运行时 bind 测不出占用）
+fn resolve_create_port(explicit: Option<i64>, taken: &HashSet<i64>) -> Result<i64, String> {
+    match explicit {
+        Some(p) if (1..=65535).contains(&p) => {
+            if taken.contains(&p) {
+                Err(format!("端口 {p} 已被其他聚合器使用"))
+            } else {
+                Ok(p)
+            }
         }
+        Some(_) => Err("端口必须在 1-65535 之间".into()),
+        None => find_free_port(taken).ok_or_else(|| "8300-8399 范围内没有可用端口".into()),
     }
-    None
+}
+
+/// 在 8300..=8399 中寻找可用端口（跳过已占用端口）
+fn find_free_port(taken: &HashSet<i64>) -> Option<i64> {
+    (8300i64..=8399).find(|&p| {
+        !taken.contains(&p) && std::net::TcpListener::bind(("127.0.0.1", p as u16)).is_ok()
+    })
 }
 
 #[tauri::command]
@@ -109,22 +122,15 @@ pub fn create_aggregator(
     if name.is_empty() {
         return Err("聚合器名称不能为空".into());
     }
-    let port = match port {
-        Some(p) if (1..=65535).contains(&p) => p,
-        Some(_) => return Err("端口必须在 1-65535 之间".into()),
-        None => find_free_port().ok_or("8300-8399 范围内没有可用端口")?,
-    };
     let token_threshold = token_threshold.unwrap_or(1_000_000).max(1);
 
     let conn = lock(&state);
-    // 端口唯一性
-    let dup = db::list_aggregators(&conn)
+    let taken: HashSet<i64> = db::list_aggregators(&conn)
         .map_err(e2s)?
         .iter()
-        .any(|a| a.port == port);
-    if dup {
-        return Err(format!("端口 {port} 已被其他聚合器使用"));
-    }
+        .map(|a| a.port)
+        .collect();
+    let port = resolve_create_port(port, &taken)?;
     let token = crate::token::generate_token();
     let agg = db::create_aggregator(&conn, &name, port, &token, token_threshold).map_err(e2s)?;
     Ok(build_view(&conn, agg, false))
@@ -286,4 +292,37 @@ pub fn running_snapshot(state: &AppState) -> HashMap<i64, u16> {
         .iter()
         .map(|(k, v)| (*k, v.port))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// 测试
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn taken(ports: &[i64]) -> HashSet<i64> {
+        ports.iter().copied().collect()
+    }
+
+    #[test]
+    fn explicit_port_range_and_uniqueness() {
+        let t = taken(&[8300, 8301]);
+        assert_eq!(resolve_create_port(Some(9000), &t), Ok(9000));
+        let err = resolve_create_port(Some(8300), &t).unwrap_err();
+        assert!(err.contains("已被其他聚合器使用"), "冲突端口应报错: {err}");
+        let err = resolve_create_port(Some(0), &t).unwrap_err();
+        assert!(err.contains("1-65535"), "越界端口应报错: {err}");
+        let err = resolve_create_port(Some(70000), &t).unwrap_err();
+        assert!(err.contains("1-65535"), "越界端口应报错: {err}");
+    }
+
+    #[test]
+    fn auto_assign_skips_taken_without_binding() {
+        // 8300-8399 全部占用：直接失败，不触发任何 bind（taken 短路保证确定性）
+        let t: HashSet<i64> = (8300..=8399).collect();
+        let err = resolve_create_port(None, &t).unwrap_err();
+        assert!(err.contains("没有可用端口"), "全部占用应报错: {err}");
+    }
 }

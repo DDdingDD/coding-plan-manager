@@ -1,13 +1,14 @@
-use crate::db::{self, MessageRow, StatsBucket, UsageStats};
+use crate::db::{self, MessageRow, MessageSummary, StatsBucket, UsageStats};
 use crate::state::AppState;
 use serde::Serialize;
 
+/// list_messages 返回：列表行不含请求/响应体（详情用 get_message 拉全量）
 #[derive(Serialize)]
 pub struct MessagePage {
     pub total: i64,
     pub page: i64,
     pub page_size: i64,
-    pub items: Vec<MessageRow>,
+    pub items: Vec<MessageSummary>,
 }
 
 fn e2s(e: rusqlite::Error) -> String {
