@@ -65,6 +65,7 @@
             >
               {{ record.running ? "停止" : "启动" }}
             </a-button>
+            <a-button size="small" @click="openEdit(record as AggregatorView)">编辑</a-button>
             <a-button size="small" @click="openDetail(record as AggregatorView)">详情</a-button>
             <a-popconfirm
               :title="record.running ? '运行中的服务将被停止并删除，确定？' : '确定删除？'"
@@ -229,7 +230,7 @@ import {
   onNewMessage,
 } from "../api";
 import type { AggregatorView } from "../types";
-import { copyText, formatNumber } from "../utils";
+import { copyText, debounce, formatNumber } from "../utils";
 
 const columns = [
   { title: "名称", dataIndex: "name", key: "name", width: 140 },
@@ -238,7 +239,7 @@ const columns = [
   { title: "AUTH_TOKEN", key: "auth_token" },
   { title: "绑定计划", key: "plans" },
   { title: "累计消耗", key: "stats", width: 180 },
-  { title: "操作", key: "actions", width: 210 },
+  { title: "操作", key: "actions", width: 260 },
 ];
 
 const bindingColumns = [
@@ -283,6 +284,16 @@ const form = reactive<{ name: string; port: number | null; token_threshold: numb
 function openCreate() {
   editing.value = null;
   Object.assign(form, { name: "", port: null, token_threshold: 1000000 });
+  modalOpen.value = true;
+}
+
+function openEdit(agg: AggregatorView) {
+  editing.value = agg;
+  Object.assign(form, {
+    name: agg.name,
+    port: agg.port,
+    token_threshold: agg.token_threshold,
+  });
   modalOpen.value = true;
 }
 
@@ -435,11 +446,11 @@ function addBinding() {
   saveBindings(ids);
 }
 
-// 实时刷新（有新消息时更新统计）
+// 实时刷新（有新消息时更新统计，防抖避免请求密集时全量查询风暴）
 let unlisten: (() => void) | null = null;
 onMounted(async () => {
   await refresh();
-  unlisten = await onNewMessage(() => refresh());
+  unlisten = await onNewMessage(debounce(() => refresh(), 300));
 });
 onUnmounted(() => unlisten?.());
 </script>

@@ -420,12 +420,12 @@ pub fn set_aggregator_plans(conn: &Connection, aggregator_id: i64, plan_ids: &[i
     Ok(())
 }
 
-pub fn add_binding_usage(conn: &Connection, binding_id: i64, tokens: i64) -> Result<()> {
-    conn.execute(
+/// 累加绑定用量，返回影响行数（0 表示绑定已不存在，如转发途中被重新绑定）
+pub fn add_binding_usage(conn: &Connection, binding_id: i64, tokens: i64) -> Result<usize> {
+    Ok(conn.execute(
         "UPDATE aggregator_plans SET used_tokens = used_tokens + ?2 WHERE id=?1",
         params![binding_id, tokens],
-    )?;
-    Ok(())
+    )?)
 }
 
 /// 将聚合器下所有绑定的已用 token 清零

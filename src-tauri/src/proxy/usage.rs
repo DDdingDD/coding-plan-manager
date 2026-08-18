@@ -83,55 +83,96 @@ pub fn parse_json_usage(body: &str) -> Usage {
     u
 }
 
-/// 解析 SSE 流文本：逐个解析 `data:` 行，后面的 usage 覆盖前面的
-/// （Anthropic 的 message_start 带 input_tokens 与缓存字段，message_delta 持续更新 output_tokens；
-///   OpenAI 在最后一个 chunk 带 usage）
-pub fn parse_sse_usage(body: &str) -> Usage {
-    let mut prompt: Option<i64> = None;
-    let mut completion: Option<i64> = None;
-    let mut total: Option<i64> = None;
-    let mut cache_read: Option<i64> = None;
-    let mut cache_creation: Option<i64> = None;
+/// SSE 用量增量解析器：边转发边按行解析，只保留不完整行的残余。
+/// 流式转发不能依赖落库缓冲解析 usage（2MB 截断会丢掉流尾部的
+/// message_delta / 最终 chunk，导致 output_tokens 严重少计），故在转发途中增量解析。
+#[derive(Default)]
+pub struct SseUsageTracker {
+    /// 跨 chunk 的不完整行残余
+    pending: Vec<u8>,
+    prompt: Option<i64>,
+    completion: Option<i64>,
+    total: Option<i64>,
+    cache_read: Option<i64>,
+    cache_creation: Option<i64>,
+}
 
-    for line in body.lines() {
+impl SseUsageTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 喂入一个上游 chunk：切出完整行立即解析，残余留给下次
+    pub fn feed(&mut self, chunk: &[u8]) {
+        self.pending.extend_from_slice(chunk);
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=pos).collect();
+            self.parse_line(&line);
+        }
+        // 防护：异常流长时间无换行时丢弃残余，避免无限增长
+        if self.pending.len() > 4 * 1024 * 1024 {
+            self.pending.clear();
+        }
+    }
+
+    /// 流结束：解析残余的最后一行（可能无换行结尾），产出合计用量
+    pub fn finish(mut self) -> Usage {
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.parse_line(&line);
+        }
+        let prompt = self.prompt.unwrap_or(0);
+        let completion = self.completion.unwrap_or(0);
+        let cache_read = self.cache_read.unwrap_or(0);
+        let cache_creation = self.cache_creation.unwrap_or(0);
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
+            total_tokens: self
+                .total
+                .unwrap_or(prompt + completion + cache_read + cache_creation),
+        }
+    }
+
+    fn parse_line(&mut self, line: &[u8]) {
+        let line = String::from_utf8_lossy(line);
         let data = match line.strip_prefix("data:") {
             Some(d) => d.trim(),
-            None => continue,
+            None => return,
         };
         if data.is_empty() || data == "[DONE]" {
-            continue;
+            return;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
             let r = normalize_usage(&v);
             if r.prompt.is_some() {
-                prompt = r.prompt;
+                self.prompt = r.prompt;
             }
             if r.completion.is_some() {
-                completion = r.completion;
+                self.completion = r.completion;
             }
             if r.total.is_some() {
-                total = r.total;
+                self.total = r.total;
             }
             if r.cache_read.is_some() {
-                cache_read = r.cache_read;
+                self.cache_read = r.cache_read;
             }
             if r.cache_creation.is_some() {
-                cache_creation = r.cache_creation;
+                self.cache_creation = r.cache_creation;
             }
         }
     }
+}
 
-    let prompt = prompt.unwrap_or(0);
-    let completion = completion.unwrap_or(0);
-    let cache_read = cache_read.unwrap_or(0);
-    let cache_creation = cache_creation.unwrap_or(0);
-    Usage {
-        prompt_tokens: prompt,
-        completion_tokens: completion,
-        cache_read_tokens: cache_read,
-        cache_creation_tokens: cache_creation,
-        total_tokens: total.unwrap_or(prompt + completion + cache_read + cache_creation),
-    }
+/// 解析 SSE 流文本：逐个解析 `data:` 行，后面的 usage 覆盖前面的
+/// （Anthropic 的 message_start 带 input_tokens 与缓存字段，message_delta 持续更新 output_tokens；
+///   OpenAI 在最后一个 chunk 带 usage）
+pub fn parse_sse_usage(body: &str) -> Usage {
+    let mut tracker = SseUsageTracker::new();
+    tracker.feed(body.as_bytes());
+    tracker.finish()
 }
 
 /// 按响应 Content-Type 选择解析方式
@@ -276,6 +317,33 @@ data: [DONE]\n";
         assert_eq!(u.prompt_tokens, 8);
         assert_eq!(u.completion_tokens, 20);
         assert_eq!(u.total_tokens, 28);
+    }
+
+    #[test]
+    fn sse_tracker_incremental_across_chunks() {
+        // 逐字节喂入，模拟任意分块边界（含多字节字符被撕开的情况）
+        let full = "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"output_tokens\":1}}}\n\
+                    \n\
+                    data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"汉字\"}}\n\
+                    \n\
+                    data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
+        let mut t = SseUsageTracker::new();
+        for b in full.as_bytes() {
+            t.feed(std::slice::from_ref(b));
+        }
+        let u = t.finish();
+        assert_eq!(u.prompt_tokens, 30);
+        assert_eq!(u.completion_tokens, 9);
+        assert_eq!(u.total_tokens, 39);
+    }
+
+    #[test]
+    fn sse_tracker_unterminated_last_line() {
+        // 最后一行无换行符，finish 时也应解析
+        let mut t = SseUsageTracker::new();
+        t.feed(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\"total_tokens\":11}}");
+        let u = t.finish();
+        assert_eq!(u.total_tokens, 11);
     }
 
     #[test]

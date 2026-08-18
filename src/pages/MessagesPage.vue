@@ -117,7 +117,7 @@ import {
   onNewMessage,
 } from "../api";
 import type { MessagePage, MessageRow } from "../types";
-import { formatNumber, prettyJson } from "../utils";
+import { debounce, formatNumber, prettyJson } from "../utils";
 
 const columns = [
   { title: "时间", dataIndex: "created_at", key: "created_at", width: 160 },
@@ -185,9 +185,11 @@ onMounted(async () => {
   listAggregators().then((aggs) => {
     aggOptions.value = aggs.map((a) => ({ value: a.id, label: a.name }));
   });
-  unlisten = await onNewMessage(() => {
-    if (realtime.value && page.value.page === 1) reload();
-  });
+  unlisten = await onNewMessage(
+    debounce(() => {
+      if (realtime.value && page.value.page === 1) reload();
+    }, 300),
+  );
 });
 onUnmounted(() => unlisten?.());
 </script>

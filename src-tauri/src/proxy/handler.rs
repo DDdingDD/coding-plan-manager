@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 
-/// 请求体最大读取 10MB
-const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024;
+/// 请求体最大读取 32MB（对齐 Anthropic 请求上限；带多张 base64 截图的合法请求可超 10MB）
+const MAX_REQUEST_BODY: usize = 32 * 1024 * 1024;
 /// 落库的请求/响应体最大长度 2MB（超出截断并标记）
 const MAX_STORED_BODY: usize = 2 * 1024 * 1024;
 /// 非流式响应最大读取 64MB（防护）
@@ -250,16 +250,19 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
         let method2 = method.clone();
         let path2 = path.clone();
         let req_stored = req_body_stored.clone();
-        let ct = content_type.clone();
         tauri::async_runtime::spawn(async move {
             let mut stream = upstream_resp.bytes_stream();
             // 累积原始字节（超过落库上限即截断），结束后一次性 lossy 解码：
             // 逐 chunk 解码会把跨分块的多字节字符撕裂成替换符
             let mut buf: Vec<u8> = Vec::new();
             let mut truncated = false;
+            // usage 在转发途中增量解析：落库缓冲超过 2MB 会截断，
+            // 而尾部 message_delta / 最终 chunk 恰是 output_tokens 的准确来源
+            let mut tracker = usage::SseUsageTracker::new();
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(bytes) => {
+                        tracker.feed(&bytes);
                         if buf.len() < MAX_STORED_BODY {
                             let remain = MAX_STORED_BODY - buf.len();
                             if bytes.len() > remain {
@@ -285,7 +288,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
             drop(tx);
 
             let collected = decode_sse_stored(&buf, truncated);
-            let u = usage::parse_usage(&ct, &collected);
+            let u = tracker.finish();
             let model = usage::extract_model(&req_stored, &collected);
             store_message(
                 &shared2,
@@ -449,7 +452,14 @@ async fn store_message(
         let conn = lock_db(shared);
         if let Some(bid) = binding_id {
             if u.total_tokens > 0 {
-                let _ = db::add_binding_usage(&conn, bid, u.total_tokens);
+                match db::add_binding_usage(&conn, bid, u.total_tokens) {
+                    Ok(0) => eprintln!(
+                        "[cpm] 绑定 {bid} 已不存在（转发途中可能被重新绑定），{} token 未计入轮转",
+                        u.total_tokens
+                    ),
+                    Err(e) => eprintln!("[cpm] 绑定用量累加失败: {e}"),
+                    _ => {}
+                }
             }
         }
         let msg = NewMessage {

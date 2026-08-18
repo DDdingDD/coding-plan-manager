@@ -1,5 +1,14 @@
 import { message } from "ant-design-vue";
 
+/** 简单防抖：连续触发时只在最后一次静默 ms 后执行（用于 message:new 事件驱动的刷新） */
+export function debounce<A extends unknown[]>(fn: (...args: A) => void, ms: number) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return (...args: A) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
+
 export function formatNumber(n: number | undefined | null): string {
   return (n ?? 0).toLocaleString();
 }

@@ -27,6 +27,7 @@
       <div class="legend">
         <span><i class="dot prompt" /> 输入 Token</span>
         <span><i class="dot cache" /> 缓存读</span>
+        <span><i class="dot cache-creation" /> 缓存写</span>
         <span><i class="dot completion" /> 输出 Token</span>
       </div>
     </a-card>
@@ -39,6 +40,7 @@
       <div class="legend">
         <span><i class="dot prompt" /> 输入 Token</span>
         <span><i class="dot cache" /> 缓存读</span>
+        <span><i class="dot cache-creation" /> 缓存写</span>
         <span><i class="dot completion" /> 输出 Token</span>
       </div>
     </a-card>
@@ -103,7 +105,7 @@ import dayjs, { type Dayjs } from "dayjs";
 import TokenBars, { type BarItem } from "../components/TokenBars.vue";
 import { dailyStats, hourlyStats, listAggregators, modelStats, onNewMessage } from "../api";
 import type { StatsBucket } from "../types";
-import { formatNumber } from "../utils";
+import { debounce, formatNumber } from "../utils";
 
 const aggOptions = ref<{ value: number; label: string }[]>([]);
 const filterAgg = ref<number | null>(null);
@@ -136,6 +138,7 @@ const dailyBars = computed<BarItem[]>(() => {
       value: total,
       promptValue: prompt,
       cacheValue: cacheRead,
+      cacheCreationValue: cacheCreation,
       completionValue: completion,
       tooltip: `${d}｜总量 ${formatNumber(total)}（入 ${formatNumber(prompt)} / 缓存读 ${formatNumber(cacheRead)} / 缓存写 ${formatNumber(cacheCreation)} / 出 ${formatNumber(completion)}）｜${b?.requests ?? 0} 次请求`,
     };
@@ -169,6 +172,7 @@ const hourlyBars = computed<BarItem[]>(() => {
       value: total,
       promptValue: prompt,
       cacheValue: cacheRead,
+      cacheCreationValue: cacheCreation,
       completionValue: completion,
       tooltip: `${key}:00-${key}:59｜总量 ${formatNumber(total)}（入 ${formatNumber(prompt)} / 缓存读 ${formatNumber(cacheRead)} / 缓存写 ${formatNumber(cacheCreation)} / 出 ${formatNumber(completion)}）｜${b?.requests ?? 0} 次请求`,
     };
@@ -232,7 +236,7 @@ onMounted(async () => {
   listAggregators().then((aggs) => {
     aggOptions.value = aggs.map((a) => ({ value: a.id, label: a.name }));
   });
-  unlisten = await onNewMessage(() => reloadAll());
+  unlisten = await onNewMessage(debounce(() => reloadAll(), 300));
 });
 onUnmounted(() => unlisten?.());
 </script>
@@ -258,6 +262,9 @@ onUnmounted(() => unlisten?.());
 }
 .dot.cache {
   background: #95de64;
+}
+.dot.cache-creation {
+  background: #faad14;
 }
 .dot.completion {
   background: #69b1ff;

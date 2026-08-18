@@ -77,17 +77,11 @@ pub fn update_plan(
     let conn = lock(&state);
     let existing = db::get_plan(&conn, id).map_err(e2s)?.ok_or("计划不存在")?;
     let enabled = enabled.unwrap_or(existing.enabled);
-    db::update_plan(
-        &conn,
-        id,
-        &name,
-        &base_url,
-        &auth_token,
-        remark.as_deref().unwrap_or(""),
-        enabled,
-    )
-    .map_err(e2s)?
-    .ok_or_else(|| "计划不存在".into())
+    // 缺省语义与 enabled 一致：省略即保持原值，而非清空
+    let remark = remark.as_deref().unwrap_or(&existing.remark);
+    db::update_plan(&conn, id, &name, &base_url, &auth_token, remark, enabled)
+        .map_err(e2s)?
+        .ok_or_else(|| "计划不存在".into())
 }
 
 #[tauri::command]
