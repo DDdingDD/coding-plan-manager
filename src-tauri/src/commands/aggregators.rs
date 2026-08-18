@@ -23,6 +23,8 @@ pub struct AggregatorView {
     pub base_url: String,
     pub bindings: Vec<BindingView>,
     pub stats: UsageStats,
+    /// 当前转发的计划（下一个请求将使用），由 strategy::peek_plan 无副作用推导
+    pub current_plan_id: Option<i64>,
 }
 
 fn e2s(e: rusqlite::Error) -> String {
@@ -50,12 +52,15 @@ fn build_view(conn: &rusqlite::Connection, agg: Aggregator, running: bool) -> Ag
         })
         .collect();
     let stats = db::aggregator_stats(conn, agg.id).unwrap_or_default();
+    // 列表/详情不应因策略推导失败而报错，容错为 None（前端显示「无可用计划」）
+    let current_plan_id = crate::proxy::strategy::peek_plan(conn, &agg).unwrap_or(None);
     AggregatorView {
         base_url: format!("http://127.0.0.1:{}", agg.port),
         running,
         aggregator: agg,
         bindings,
         stats,
+        current_plan_id,
     }
 }
 

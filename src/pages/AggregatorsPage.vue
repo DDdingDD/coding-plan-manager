@@ -44,13 +44,17 @@
           </a-flex>
         </template>
         <template v-else-if="column.key === 'plans'">
-          <a-tag v-for="b in record.bindings" :key="b.plan_id" style="margin: 2px">
-            {{ b.plan_name }}
-            <a-tooltip :title="`已用 ${formatNumber(b.used_tokens)} / 阈值 ${formatNumber(b.token_threshold)}`">
-              <InfoCircleOutlined style="margin-left: 4px" />
-            </a-tooltip>
-          </a-tag>
+          <a-tooltip v-for="b in record.bindings" :key="b.plan_id" :title="bindingTitle(record, b)">
+            <a-tag
+              :color="b.plan_id === record.current_plan_id ? 'green' : 'default'"
+              :style="{ margin: 2, opacity: b.enabled ? 1 : 0.45 }"
+            >
+              <AimOutlined v-if="b.plan_id === record.current_plan_id" style="margin-right: 4px" />
+              {{ b.plan_name }}{{ b.enabled ? "" : "（禁）" }}
+            </a-tag>
+          </a-tooltip>
           <a-tag v-if="!record.bindings.length" color="warning">未绑定</a-tag>
+          <a-tag v-else-if="record.current_plan_id == null" color="error">无可用计划</a-tag>
         </template>
         <template v-else-if="column.key === 'stats'">
           {{ formatNumber(record.stats.total_tokens) }} tokens / {{ formatNumber(record.stats.requests) }} 次
@@ -133,6 +137,16 @@
         </a-card>
 
         <a-card size="small" title="转发策略" style="margin-bottom: 16px">
+          <a-flex align="center" :gap="8" style="margin-bottom: 8px">
+            <span>当前转发：</span>
+            <a-tag v-if="currentPlanName" color="green">
+              <AimOutlined style="margin-right: 4px" />{{ currentPlanName }}
+            </a-tag>
+            <a-tag v-else color="error">无可用计划</a-tag>
+            <a-typography-text type="secondary" style="font-size: 12px">
+              下一请求将转发到此计划
+            </a-typography-text>
+          </a-flex>
           <a-flex align="center" :gap="8">
             <a-tag color="blue">阈值轮转 threshold_rotation</a-tag>
             <span>单计划阈值</span>
@@ -157,7 +171,17 @@
             row-key="plan_id"
           >
             <template #bodyCell="{ column, record, index }">
-              <template v-if="column.key === 'usage'">
+              <template v-if="column.key === 'plan_name'">
+                {{ record.plan_name }}
+                <a-tag
+                  v-if="record.plan_id === detail?.current_plan_id"
+                  color="green"
+                  style="margin-left: 4px"
+                >
+                  当前
+                </a-tag>
+              </template>
+              <template v-else-if="column.key === 'usage'">
                 <a-progress
                   :percent="Math.min(100, Math.round((record.used_tokens / Math.max(1, record.token_threshold)) * 100))"
                   :status="record.used_tokens >= record.token_threshold ? 'exception' : 'active'"
@@ -209,12 +233,12 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { message } from "ant-design-vue";
 import {
+  AimOutlined,
   CopyOutlined,
   DeleteOutlined,
   DownOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
-  InfoCircleOutlined,
   UpOutlined,
 } from "@ant-design/icons-vue";
 import {
@@ -255,6 +279,18 @@ const showToken = reactive<Record<number, boolean>>({});
 const toggling = reactive<Record<number, boolean>>({});
 
 const maskToken = (t: string) => (t.length > 8 ? `${t.slice(0, 5)}••••••${t.slice(-4)}` : "••••");
+
+/** 绑定 tag 的悬停提示：当前转发 / 已禁用 / 已达阈值 / 用量 */
+function bindingTitle(
+  b: { plan_id: number; enabled: boolean; used_tokens: number; token_threshold: number },
+  currentPlanId: number | null,
+): string {
+  const usage = `已用 ${formatNumber(b.used_tokens)} / 阈值 ${formatNumber(b.token_threshold)}`;
+  if (b.plan_id === currentPlanId) return `当前转发到此计划（${usage}）`;
+  if (!b.enabled) return "已禁用，不参与轮转";
+  if (b.used_tokens >= b.token_threshold) return `已达阈值，等待回绕（${usage}）`;
+  return usage;
+}
 
 async function refresh() {
   loading.value = true;
@@ -358,6 +394,13 @@ async function toggleRun(agg: AggregatorView) {
 // ---- 详情抽屉 ----
 const detailOpen = ref(false);
 const detail = ref<AggregatorView | null>(null);
+/** 当前转发计划（current_plan_id 对应绑定）的名称，无可用计划时为 null */
+const currentPlanName = computed(() => {
+  if (!detail.value) return null;
+  return (
+    detail.value.bindings.find((b) => b.plan_id === detail.value!.current_plan_id)?.plan_name ?? null
+  );
+});
 const thresholdDraft = ref<number>(0);
 const savingThreshold = ref(false);
 const resetting = ref(false);

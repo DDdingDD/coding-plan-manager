@@ -60,6 +60,8 @@ export interface AggregatorView extends Aggregator {
   base_url: string;
   bindings: BindingView[];
   stats: UsageStats;
+  /** 当前转发的计划（下一个请求将使用）；无可用计划时为 null */
+  current_plan_id: number | null;
 }
 
 export interface MessageRow {
