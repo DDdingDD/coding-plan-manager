@@ -3,6 +3,7 @@ pub mod db;
 pub mod proxy;
 mod state;
 mod token;
+mod tray;
 
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
@@ -19,6 +20,7 @@ pub fn run() {
                 db: Arc::new(Mutex::new(conn)),
                 servers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             });
+            tray::setup_tray(app)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -4,6 +4,10 @@
       <div class="logo">Coding Plan Manager</div>
       <a-menu v-model:selectedKeys="current" mode="inline" :items="menuItems" />
       <div class="global-stats">
+        <div class="tray-setting">
+          <a-switch size="small" v-model:checked="hideOnClose" />
+          <span>关闭时隐藏到托盘</span>
+        </div>
         <a-statistic title="累计 Token" :value="stats.total_tokens" style="margin-bottom: 4px" />
         <a-statistic title="累计请求" :value="stats.requests" />
       </div>
@@ -18,7 +22,7 @@
 </template>
 
 <script setup lang="ts">
-import { h, onMounted, onUnmounted, ref, type Component } from "vue";
+import { h, onMounted, onUnmounted, ref, watch, type Component } from "vue";
 import {
   ApiOutlined,
   BarChartOutlined,
@@ -72,12 +76,22 @@ const refreshStats = () => globalStats().then((s) => (stats.value = s));
 
 let unlisten: (() => void) | null = null;
 let unlistenClose: (() => void) | null = null;
+
+// 关闭窗口行为偏好：true=隐藏到托盘，false=弹退出确认框；localStorage 持久化，默认开启
+const HIDE_ON_CLOSE_KEY = "cpm.hideOnClose";
+const hideOnClose = ref(localStorage.getItem(HIDE_ON_CLOSE_KEY) !== "0");
+watch(hideOnClose, (v) => localStorage.setItem(HIDE_ON_CLOSE_KEY, v ? "1" : "0"));
+
 onMounted(async () => {
   refreshStats();
   unlisten = await onNewMessage(() => refreshStats());
-  // 关闭窗口前弹出确认框；确认后用 destroy() 绕过 close-requested 真正退出
+  // 拦截关闭：开启偏好时直接隐藏到托盘；否则弹确认框，确认后用 destroy() 绕过 close-requested 真正退出
   unlistenClose = await getCurrentWindow().onCloseRequested((event) => {
     event.preventDefault();
+    if (hideOnClose.value) {
+      getCurrentWindow().hide();
+      return;
+    }
     Modal.confirm({
       title: "确定要退出程序吗？",
       content: "退出后将停止所有运行中的聚合器服务。",
@@ -114,6 +128,14 @@ body {
   bottom: 0;
   width: 200px;
   background: #fff;
+}
+.tray-setting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: #595959;
 }
 .ant-statistic-title {
   font-size: 12px;
