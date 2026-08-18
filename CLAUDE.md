@@ -27,12 +27,13 @@ node scripts/mock-upstream.mjs 9401      # 本地模拟上游（Anthropic/OpenAI
 
 ## 架构
 
-前端 `src/`（Vue 3 + ant-design-vue，三个页面），后端 `src-tauri/src/`。核心在 Rust 侧：
+前端 `src/`（Vue 3 + ant-design-vue，四个页面：计划/聚合器/消息/统计），后端 `src-tauri/src/`。核心在 Rust 侧：
 
 - **请求转发主链路** `proxy/handler.rs`（兜底路由，任意 method/path）：校验聚合器令牌（Bearer/x-api-key 均可）→ `strategy.rs` 选计划 → reqwest 转发（剥跳段头/原鉴权头，注入所选计划的 AUTH_TOKEN 为 Bearer + x-api-key 双头）→ 响应回传（SSE 走 mpsc channel 流式透传并累积副本；JSON 整体回传）→ `usage.rs` 解析用量（OpenAI/Anthropic 的 JSON 与 SSE 格式，Anthropic message_start 的 usage 嵌套在 `message.usage`；同时解析 prompt caching 的 `cache_read_input_tokens`/`cache_creation_input_tokens`，Anthropic 无显式 total 时按原始口径合计四项 input + cache_read + cache_creation + output，因此驱动轮转的绑定用量含缓存部分；OpenAI 的 `prompt_tokens_details.cached_tokens` 是 prompt 子集，刻意不解析以免重复计数）→ 落库 + 累加绑定用量 + emit `message:new` 事件推前端。
 - **阈值轮转** `proxy/strategy.rs`：按绑定顺序取第一个"启用且 used_tokens < token_threshold"的计划；**全部超额时清零所有绑定并回绕到第一个**（需求语义，勿改成 503）；仅"无任何启用计划"返回 503。
 - **服务生命周期** `proxy/mod.rs::start_server`：bind TcpListener → spawn axum（CancellationToken 优雅关停）。运行中的服务句柄存 `state.rs AppState.servers`（仅内存，应用重启后不自动恢复）。
-- **Tauri 命令层** `commands/`（plans/aggregators/messages）：thin wrapper，每个命令自行 `lock()` 拿连接。
+- **Tauri 命令层** `commands/`（plans/aggregators/messages）：thin wrapper，每个命令自行 `lock()` 拿连接；统计查询命令（global/daily/hourly/model_stats）在 messages.rs。
+- **系统托盘** `tray.rs`：左键单击/菜单恢复主窗口；关闭窗口默认隐藏到托盘，侧边栏开关可改为退出确认（偏好存 localStorage，逻辑在 `App.vue`）。
 - **单连接模型**：整个应用共享一个 `Arc<Mutex<rusqlite::Connection>>`（commands 与代理服务共用）。handler **每次请求从 DB 重读聚合器配置**，因此阈值/令牌修改即时生效，无需重启服务；仅改端口要求先停止。
 
 **统计的双轨设计（有意为之）**：`messages` 表 SUM 是历史统计（清零回绕不影响）；`aggregator_plans.used_tokens` 是轮转状态（回绕时清零）。测试断言时注意两者差异。

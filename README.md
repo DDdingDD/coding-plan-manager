@@ -27,7 +27,8 @@
 - **Plan Aggregator**：一个聚合器绑定多个 Coding Plan；创建时自动生成对外 AUTH_TOKEN 与端口
 - **转发策略（阈值轮转）**：按绑定顺序使用计划；某计划累计消耗达到阈值后自动切到下一个；**全部达到阈值后自动清零回绕**到第一个重新计数
 - **透明代理**：任意 method/path 转发（`/v1/messages`、`/v1/chat/completions`、`count_tokens`…均可）；`Authorization: Bearer` 与 `x-api-key` 双头兼容；`anthropic-version` / `anthropic-beta` 等头原样透传；SSE 流式响应边转发边统计
-- **统计**：聚合器维度 / 计划维度 / 全局的 token（输入/输出/总量）与请求数
+- **统计**：全局概览与按天 / 按小时 / 按模型的 token 用量（输入/输出/缓存）及请求数，支持按聚合器和时间段（全部/近 7/14/30 天）筛选
+- **系统托盘**：关闭窗口默认隐藏到托盘（左键单击恢复），可在侧边栏改为退出前弹确认框；托盘菜单可退出程序
 - **消息记录**：每条转发请求的完整请求体 / 响应体（超 2MB 截断）、状态码、耗时、token 用量，实时推送 UI
 - **服务启停**：随时启动 / 停止聚合器，端口冲突友好报错
 
@@ -39,7 +40,7 @@
 npm install
 npm run tauri dev      # 开发
 npm run tauri build    # 打包
-cargo test --manifest-path src-tauri/Cargo.toml   # 后端单元测试
+cargo test --manifest-path src-tauri/Cargo.toml   # 后端测试（单测 + e2e）
 ```
 
 ### 验收用模拟上游
