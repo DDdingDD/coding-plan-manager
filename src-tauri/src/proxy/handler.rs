@@ -168,7 +168,8 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
             reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
             reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
         ) {
-            fwd_headers.insert(n, v);
+            // append 保住重复头的多个值（insert 会只剩最后一个）
+            fwd_headers.append(n, v);
         }
     }
     let plan_token = pick.plan.auth_token.clone();
@@ -252,16 +253,20 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
         let ct = content_type.clone();
         tauri::async_runtime::spawn(async move {
             let mut stream = upstream_resp.bytes_stream();
-            let mut collected = String::new();
+            // 累积原始字节（超过落库上限即截断），结束后一次性 lossy 解码：
+            // 逐 chunk 解码会把跨分块的多字节字符撕裂成替换符
+            let mut buf: Vec<u8> = Vec::new();
             let mut truncated = false;
             while let Some(chunk) = stream.next().await {
                 match chunk {
                     Ok(bytes) => {
-                        if collected.len() < MAX_STORED_BODY {
-                            collected.push_str(&String::from_utf8_lossy(&bytes));
-                            if collected.len() > MAX_STORED_BODY {
-                                truncate_char_safe(&mut collected, MAX_STORED_BODY);
+                        if buf.len() < MAX_STORED_BODY {
+                            let remain = MAX_STORED_BODY - buf.len();
+                            if bytes.len() > remain {
+                                buf.extend_from_slice(&bytes[..remain]);
                                 truncated = true;
+                            } else {
+                                buf.extend_from_slice(&bytes);
                             }
                         } else {
                             truncated = true;
@@ -279,13 +284,9 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
             }
             drop(tx);
 
+            let collected = decode_sse_stored(&buf, truncated);
             let u = usage::parse_usage(&ct, &collected);
-            let resp_stored = if truncated {
-                format!("{collected}\n…[已截断]")
-            } else {
-                collected
-            };
-            let model = usage::extract_model(&req_stored, &resp_stored);
+            let model = usage::extract_model(&req_stored, &collected);
             store_message(
                 &shared2,
                 agg_id,
@@ -295,7 +296,7 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
                 &path2,
                 status_code,
                 &req_stored,
-                &resp_stored,
+                &collected,
                 model,
                 &u,
                 started,
@@ -404,12 +405,17 @@ fn cap_store(s: &str) -> String {
     format!("{}\n…[已截断]", &s[..end])
 }
 
-fn truncate_char_safe(s: &mut String, limit: usize) {
-    let mut end = limit.min(s.len());
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+/// SSE 落库文本解码：一次性 lossy 转换（原始字节整体解码，不受分块边界影响）；
+/// 截断点落在多字节字符中间时去掉尾部替换符，再补截断标记
+fn decode_sse_stored(buf: &[u8], truncated: bool) -> String {
+    let mut s = String::from_utf8_lossy(buf).into_owned();
+    if truncated {
+        if s.ends_with('\u{FFFD}') {
+            s.pop();
+        }
+        s.push_str("\n…[已截断]");
     }
-    s.truncate(end);
+    s
 }
 
 /// Anthropic 风格的错误响应体
@@ -509,14 +515,23 @@ mod tests {
     }
 
     #[test]
-    fn truncate_char_safe_keeps_boundary() {
-        // "abc汉" 字节长 6，limit 5 落在 "汉" 的中间 -> 应回退到 "abc"
-        let mut s = "abc汉".to_string();
-        truncate_char_safe(&mut s, 5);
-        assert_eq!(s, "abc");
+    fn decode_sse_stored_multibyte_intact() {
+        // 分块累积后的完整字节一次性解码，多字节字符不被撕裂
+        assert_eq!(decode_sse_stored("abc汉def".as_bytes(), false), "abc汉def");
+        assert_eq!(decode_sse_stored(b"", false), "");
+    }
 
-        let mut s = "abc".to_string();
-        truncate_char_safe(&mut s, 100);
-        assert_eq!(s, "abc", "limit 超长时原样保留");
+    #[test]
+    fn decode_sse_stored_truncated_mid_char() {
+        // 截断点落在 "汉"（E6 B1 89）中间：撕裂出的替换符去掉，再补标记
+        let out = decode_sse_stored(b"abc\xe6\xb1", true);
+        assert_eq!(out, "abc\n…[已截断]");
+        assert!(!out.contains('\u{FFFD}'), "不应残留替换符: {out:?}");
+    }
+
+    #[test]
+    fn decode_sse_stored_truncated_on_boundary() {
+        // 截断点恰好是字符边界：原样保留再补标记
+        assert_eq!(decode_sse_stored("abc汉".as_bytes(), true), "abc汉\n…[已截断]");
     }
 }

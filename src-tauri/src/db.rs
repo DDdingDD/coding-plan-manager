@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, OptionalExtension, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result, ToSql};
 use serde::{Deserialize, Serialize};
 
 /// 轮转策略标识（当前版本仅实现阈值轮转）
@@ -493,12 +493,13 @@ fn row_to_bucket(row: &rusqlite::Row) -> Result<StatsBucket> {
 
 /// 通用分组统计：key_sql 为分组表达式（天/小时/模型），可选聚合器过滤。
 /// ordering 为 ORDER BY 表达式（小时/模型分组与 key 顺序不同）。
+/// 过滤值一律走参数绑定，占位符序号由调用方在 where_clause 中与 params 一一对应。
 fn bucket_query(
     conn: &Connection,
     key_sql: &str,
     where_clause: &str,
     ordering: &str,
-    param: Option<i64>,
+    bind: &[&dyn ToSql],
 ) -> Result<Vec<StatsBucket>> {
     let sql = format!(
         "SELECT {key_sql} AS k, COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0), \
@@ -507,10 +508,7 @@ fn bucket_query(
          FROM messages {where_clause} GROUP BY k ORDER BY {ordering}"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = match param {
-        Some(v) => stmt.query_map(params![v], row_to_bucket)?.collect::<Result<Vec<_>>>()?,
-        None => stmt.query_map([], row_to_bucket)?.collect::<Result<Vec<_>>>()?,
-    };
+    let rows = stmt.query_map(bind, row_to_bucket)?.collect::<Result<Vec<_>>>()?;
     Ok(rows)
 }
 
@@ -519,34 +517,37 @@ pub fn stats_daily(conn: &Connection, aggregator_id: Option<i64>, days: i64) -> 
     let cutoff = (chrono::Local::now() - chrono::Duration::days(days - 1))
         .format("%Y-%m-%d")
         .to_string();
-    let (where_clause, param) = match aggregator_id {
-        Some(id) => (format!("WHERE aggregator_id=?1 AND substr(created_at,1,10)>=('{cutoff}')"), Some(id)),
-        None => (format!("WHERE substr(created_at,1,10)>=('{cutoff}')"), None),
+    let (where_clause, bind): (&str, Vec<&dyn ToSql>) = match aggregator_id.as_ref() {
+        Some(id) => (
+            "WHERE aggregator_id=?1 AND substr(created_at,1,10)>=?2",
+            vec![id, &cutoff],
+        ),
+        None => ("WHERE substr(created_at,1,10)>=?1", vec![&cutoff]),
     };
     bucket_query(
         conn,
         "substr(created_at,1,10)",
-        &where_clause,
+        where_clause,
         "k",
-        param,
+        &bind,
     )
 }
 
 /// 按小时统计：指定日期（"YYYY-MM-DD"）内 0-23 点各小时用量
 pub fn stats_hourly(conn: &Connection, aggregator_id: Option<i64>, date: &str) -> Result<Vec<StatsBucket>> {
-    let (where_clause, param) = match aggregator_id {
+    let (where_clause, bind): (&str, Vec<&dyn ToSql>) = match aggregator_id.as_ref() {
         Some(id) => (
-            format!("WHERE aggregator_id=?1 AND substr(created_at,1,10)=('{date}')"),
-            Some(id),
+            "WHERE aggregator_id=?1 AND substr(created_at,1,10)=?2",
+            vec![id, &date],
         ),
-        None => (format!("WHERE substr(created_at,1,10)=('{date}')"), None),
+        None => ("WHERE substr(created_at,1,10)=?1", vec![&date]),
     };
     bucket_query(
         conn,
         "substr(created_at,12,2)",
-        &where_clause,
+        where_clause,
         "CAST(k AS INTEGER)",
-        param,
+        &bind,
     )
 }
 
@@ -561,27 +562,29 @@ pub fn stats_by_model(
             .format("%Y-%m-%d")
             .to_string()
     });
-    let mut where_clause = String::new();
-    let mut params: Vec<i64> = Vec::new();
-    if let Some(id) = aggregator_id {
-        params.push(id);
-        where_clause.push_str(&format!("WHERE aggregator_id=?{} ", params.len()));
+
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut bind: Vec<&dyn ToSql> = Vec::new();
+    if let Some(id) = aggregator_id.as_ref() {
+        bind.push(id);
+        where_parts.push(format!("aggregator_id=?{}", bind.len()));
     }
-    if let Some(c) = cutoff {
-        if where_clause.is_empty() {
-            where_clause.push_str("WHERE ");
-        } else {
-            where_clause.push_str("AND ");
-        }
-        where_clause.push_str(&format!("substr(created_at,1,10)>=('{c}')"));
+    if let Some(c) = cutoff.as_ref() {
+        bind.push(c);
+        where_parts.push(format!("substr(created_at,1,10)>=?{}", bind.len()));
     }
-    bucket_query(conn, "model", &where_clause, "COALESCE(SUM(total_tokens),0) DESC, k", {
-        // 参数个数由是否带聚合器过滤决定
-        match params.len() {
-            1 => Some(params[0]),
-            _ => None,
-        }
-    })
+    let where_clause = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", where_parts.join(" AND "))
+    };
+    bucket_query(
+        conn,
+        "model",
+        &where_clause,
+        "COALESCE(SUM(total_tokens),0) DESC, k",
+        &bind,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +908,10 @@ mod tests {
 
         // 聚合器过滤（其他聚合器 id 应为空）
         assert!(stats_daily(&conn, Some(agg.id + 100), 1).unwrap().is_empty());
+
+        // 日期按字面量绑定：含 SQL 特殊字符的 date 不会被执行为语法
+        let evil = format!("{today}' OR '1'='1");
+        assert!(stats_hourly(&conn, None, &evil).unwrap().is_empty());
 
         // 迁移：旧库（无 model 列）打开后自动补列
         let old = Connection::open_in_memory().unwrap();

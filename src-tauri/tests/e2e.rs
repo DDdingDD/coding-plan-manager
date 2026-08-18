@@ -95,9 +95,20 @@ async fn spawn_mock_upstream(mode: MockMode) -> (String, Arc<Mutex<Vec<String>>>
                         r#"{"type":"error","error":{"type":"rate_limit_error","message":"超出速率限制"}}"#.to_string(),
                     ),
                     MockMode::Echo => {
+                        // 重复头的多个值合并为 "a, b"，便于断言 append 语义
                         let mut headers = serde_json::Map::new();
                         for (n, v) in &header_pairs {
-                            headers.insert(n.clone(), serde_json::Value::String(v.clone()));
+                            match headers.get_mut(n) {
+                                Some(serde_json::Value::String(prev)) => {
+                                    *prev = format!("{prev}, {v}");
+                                }
+                                _ => {
+                                    headers.insert(
+                                        n.clone(),
+                                        serde_json::Value::String(v.clone()),
+                                    );
+                                }
+                            }
                         }
                         (
                             200,
@@ -505,6 +516,8 @@ async fn e2e_header_passthrough_and_strip() {
             ("anthropic-version", "2023-06-01".to_string()),
             ("anthropic-beta", "context-1m-2025-08-07".to_string()),
             ("x-custom-header", "keep-me".to_string()),
+            ("x-multi-header", "one".to_string()),
+            ("x-multi-header", "two".to_string()),
             ("accept-encoding", "gzip".to_string()),
             ("host", "evil.example".to_string()),
         ],
@@ -522,6 +535,8 @@ async fn e2e_header_passthrough_and_strip() {
     assert_eq!(h["anthropic-version"], "2023-06-01");
     assert_eq!(h["anthropic-beta"], "context-1m-2025-08-07");
     assert_eq!(h["x-custom-header"], "keep-me");
+    // 重复头的多个值都应转发（append 语义，而非只剩最后一个）
+    assert_eq!(h["x-multi-header"], "one, two");
 
     // 鉴权头替换为计划的 AUTH_TOKEN（Bearer + x-api-key 双头）
     assert_eq!(h["authorization"], "Bearer tokH");

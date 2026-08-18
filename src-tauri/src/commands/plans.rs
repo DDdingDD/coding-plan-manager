@@ -71,6 +71,9 @@ pub fn update_plan(
     if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
         return Err("BASE_URL 必须以 http:// 或 https:// 开头".into());
     }
+    if auth_token.is_empty() {
+        return Err("AUTH_TOKEN 不能为空".into());
+    }
     let conn = lock(&state);
     let existing = db::get_plan(&conn, id).map_err(e2s)?.ok_or("计划不存在")?;
     let enabled = enabled.unwrap_or(existing.enabled);
