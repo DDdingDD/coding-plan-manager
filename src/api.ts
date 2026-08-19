@@ -6,6 +6,7 @@ import type {
   MessageRow,
   PlanView,
   StatsBucket,
+  TripStats,
   UsageStats,
 } from "./types";
 
@@ -117,6 +118,12 @@ export const clearMessages = (aggregatorId?: number | null) =>
   invoke<number>("clear_messages", { aggregatorId: aggregatorId ?? null });
 
 export const globalStats = () => invoke<UsageStats>("global_stats");
+
+/** 小计里程（自上次重置以来；未重置时为全部历史） */
+export const tripStats = () => invoke<TripStats>("trip_stats");
+
+/** 重置小计里程（不影响累计统计） */
+export const resetTrip = () => invoke<TripStats>("reset_trip");
 
 /** 按天统计（近 days 天） */
 export const dailyStats = (p: { aggregatorId?: number | null; days?: number } = {}) =>

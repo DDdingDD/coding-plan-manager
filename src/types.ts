@@ -20,6 +20,12 @@ export interface StatsBucket {
   requests: number;
 }
 
+/** 小计里程：自上次手动重置以来的用量（started_at 为 null 表示从未重置，计入全部历史） */
+export interface TripStats {
+  started_at: string | null;
+  stats: UsageStats;
+}
+
 export interface CodingPlan {
   id: number;
   name: string;

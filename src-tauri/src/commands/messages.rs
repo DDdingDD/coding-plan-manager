@@ -1,4 +1,4 @@
-use crate::db::{self, MessageRow, MessageSummary, StatsBucket, UsageStats};
+use crate::db::{self, MessageRow, MessageSummary, StatsBucket, TripStats, UsageStats};
 use crate::state::AppState;
 use serde::Serialize;
 
@@ -62,6 +62,20 @@ pub fn clear_messages(
 pub fn global_stats(state: tauri::State<'_, AppState>) -> Result<UsageStats, String> {
     let conn = lock(&state);
     db::global_stats(&conn).map_err(e2s)
+}
+
+/// 小计里程：自上次手动重置以来的用量统计（未重置时为全部历史）
+#[tauri::command]
+pub fn trip_stats(state: tauri::State<'_, AppState>) -> Result<TripStats, String> {
+    let conn = lock(&state);
+    db::trip_stats(&conn).map_err(e2s)
+}
+
+/// 重置小计里程（起点改为当前时间，不影响累计统计）
+#[tauri::command]
+pub fn reset_trip(state: tauri::State<'_, AppState>) -> Result<TripStats, String> {
+    let conn = lock(&state);
+    db::reset_trip(&conn).map_err(e2s)
 }
 
 /// 按天统计（近 days 天，缺省 30）

@@ -10,6 +10,20 @@
         </div>
         <a-statistic title="累计 Token" :value="stats.total_tokens" style="margin-bottom: 4px" />
         <a-statistic title="累计请求" :value="stats.requests" />
+        <a-divider style="margin: 8px 0" />
+        <div class="trip-header">
+          <span class="trip-title" :title="tripTitle">小计{{ tripStartLabel }}</span>
+          <a-popconfirm
+            title="重置小计统计？"
+            ok-text="重置"
+            cancel-text="取消"
+            @confirm="doResetTrip"
+          >
+            <a-button size="small" type="text" class="trip-reset">重置</a-button>
+          </a-popconfirm>
+        </div>
+        <a-statistic title="小计 Token" :value="trip.stats.total_tokens" style="margin-bottom: 4px" />
+        <a-statistic title="小计请求" :value="trip.stats.requests" />
       </div>
     </a-layout-sider>
     <a-layout-content style="padding: 16px; overflow: auto">
@@ -22,22 +36,22 @@
 </template>
 
 <script setup lang="ts">
-import { h, onMounted, onUnmounted, ref, watch, type Component } from "vue";
+import { computed, h, onMounted, onUnmounted, ref, watch, type Component } from "vue";
 import {
   ApiOutlined,
   BarChartOutlined,
   ClusterOutlined,
   MessageOutlined,
 } from "@ant-design/icons-vue";
-import { Modal } from "ant-design-vue";
+import { Modal, message } from "ant-design-vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import PlansPage from "./pages/PlansPage.vue";
 import AggregatorsPage from "./pages/AggregatorsPage.vue";
 import MessagesPage from "./pages/MessagesPage.vue";
 import StatsPage from "./pages/StatsPage.vue";
-import { globalStats, onNewMessage } from "./api";
+import { globalStats, onNewMessage, resetTrip, tripStats } from "./api";
 import { debounce } from "./utils";
-import type { UsageStats } from "./types";
+import type { TripStats, UsageStats } from "./types";
 
 const current = ref<string[]>(["aggregators"]);
 
@@ -73,7 +87,34 @@ const stats = ref<UsageStats>({
   requests: 0,
 });
 
-const refreshStats = () => globalStats().then((s) => (stats.value = s));
+// 小计里程：自上次手动重置以来的用量（未重置时与累计一致）
+const emptyTrip: TripStats = {
+  started_at: null,
+  stats: { ...stats.value },
+};
+const trip = ref<TripStats>(emptyTrip);
+
+const tripStartLabel = computed(() =>
+  trip.value.started_at ? ` · 自 ${trip.value.started_at.slice(5, 16)}` : " · 未重置",
+);
+const tripTitle = computed(() =>
+  trip.value.started_at ? `自 ${trip.value.started_at} 起` : "尚未重置，计入全部历史",
+);
+
+const refreshStats = () =>
+  Promise.all([globalStats(), tripStats()]).then(([g, t]) => {
+    stats.value = g;
+    trip.value = t;
+  });
+
+async function doResetTrip() {
+  try {
+    trip.value = await resetTrip();
+    message.success("小计已重置");
+  } catch (e) {
+    message.error(String(e));
+  }
+}
 
 let unlisten: (() => void) | null = null;
 let unlistenClose: (() => void) | null = null;
@@ -138,6 +179,25 @@ body {
   margin-bottom: 12px;
   font-size: 12px;
   color: #595959;
+}
+.trip-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.trip-title {
+  font-size: 12px;
+  color: #595959;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.trip-reset {
+  flex: none;
+  height: 20px;
+  padding: 0 4px;
+  font-size: 12px;
 }
 .ant-statistic-title {
   font-size: 12px;

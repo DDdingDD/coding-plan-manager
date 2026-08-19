@@ -112,6 +112,13 @@ pub struct UsageStats {
     pub requests: i64,
 }
 
+/// 小计里程：自上次手动重置以来的用量统计（started_at 为 None 表示从未重置，计入全部历史）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TripStats {
+    pub started_at: Option<String>,
+    pub stats: UsageStats,
+}
+
 /// 分组统计的一个桶（按天 / 按小时 / 按模型），key 为日期、小时或模型名
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsBucket {
@@ -188,7 +195,14 @@ pub fn init_db(path: &str) -> Result<Connection> {
         -- 按天/按小时统计以 substr(created_at,1,10) 过滤与分组，
         -- 表达式索引须与查询中的表达式完全一致才能命中
         CREATE INDEX IF NOT EXISTS idx_messages_date  ON messages(substr(created_at,1,10));
+        -- 小计里程按 created_at 范围过滤
+        CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
         CREATE INDEX IF NOT EXISTS idx_agg_plans_agg  ON aggregator_plans(aggregator_id);
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         ",
     )?;
     migrate(&conn)?;
@@ -466,7 +480,7 @@ pub fn reset_binding_usage(conn: &Connection, aggregator_id: i64) -> Result<usiz
 // 统计
 // ---------------------------------------------------------------------------
 
-fn stats_query(conn: &Connection, where_clause: &str, param: Option<i64>) -> Result<UsageStats> {
+fn stats_query(conn: &Connection, where_clause: &str, param: Option<&dyn ToSql>) -> Result<UsageStats> {
     let sql = format!(
         "SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0),
                 COALESCE(SUM(completion_tokens),0), COALESCE(SUM(cache_read_tokens),0),
@@ -490,15 +504,54 @@ fn stats_query(conn: &Connection, where_clause: &str, param: Option<i64>) -> Res
 }
 
 pub fn aggregator_stats(conn: &Connection, aggregator_id: i64) -> Result<UsageStats> {
-    stats_query(conn, "WHERE aggregator_id=?1", Some(aggregator_id))
+    stats_query(conn, "WHERE aggregator_id=?1", Some(&aggregator_id))
 }
 
 pub fn plan_stats(conn: &Connection, plan_id: i64) -> Result<UsageStats> {
-    stats_query(conn, "WHERE plan_id=?1", Some(plan_id))
+    stats_query(conn, "WHERE plan_id=?1", Some(&plan_id))
 }
 
 pub fn global_stats(conn: &Connection) -> Result<UsageStats> {
     stats_query(conn, "", None)
+}
+
+// ---------------------------------------------------------------------------
+// 小计里程（trip meter）
+// ---------------------------------------------------------------------------
+
+/// settings 表中记录小计起点时间的键，值为 created_at 同格式的本地时间串
+pub const SETTING_TRIP_STARTED_AT: &str = "trip_started_at";
+
+pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row("SELECT value FROM settings WHERE key=?1", params![key], |row| {
+        row.get(0)
+    })
+    .optional()
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+/// 小计统计：从未重置（起点为 NULL）时计入全部历史，与累计一致
+pub fn trip_stats(conn: &Connection) -> Result<TripStats> {
+    let started_at = get_setting(conn, SETTING_TRIP_STARTED_AT)?;
+    let stats = match started_at.as_deref() {
+        Some(since) => stats_query(conn, "WHERE created_at>=?1", Some(&since))?,
+        None => stats_query(conn, "", None)?,
+    };
+    Ok(TripStats { started_at, stats })
+}
+
+/// 重置小计：起点改为当前时间（不改任何消息数据，累计统计不受影响）
+pub fn reset_trip(conn: &Connection) -> Result<TripStats> {
+    set_setting(conn, SETTING_TRIP_STARTED_AT, &now_str())?;
+    trip_stats(conn)
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +916,74 @@ mod tests {
 
         assert_eq!(clear_messages(&conn, Some(agg.id)).unwrap(), 5);
         assert_eq!(global_stats(&conn).unwrap().requests, 0);
+    }
+
+    #[test]
+    fn trip_meter() {
+        let conn = mem();
+        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100).unwrap();
+        // 插入一条 total_tokens=total 的消息；created 为 Some 时改写 created_at 便于构造时间线
+        let insert_at = |total: i64, created: Option<&str>| {
+            insert_message(
+                &conn,
+                &NewMessage {
+                    aggregator_id: agg.id,
+                    plan_id: None,
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    status: 200,
+                    request_body: "".into(),
+                    response_body: "".into(),
+                    model: "glm-4.7".into(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    total_tokens: total,
+                    duration_ms: 1,
+                },
+            )
+            .unwrap();
+            if let Some(c) = created {
+                conn.execute(
+                    "UPDATE messages SET created_at=?1 WHERE id=(SELECT MAX(id) FROM messages)",
+                    params![c],
+                )
+                .unwrap();
+            }
+        };
+
+        // settings 读写 + 幂等覆写
+        assert_eq!(get_setting(&conn, "k").unwrap(), None);
+        set_setting(&conn, "k", "v1").unwrap();
+        set_setting(&conn, "k", "v2").unwrap();
+        assert_eq!(get_setting(&conn, "k").unwrap().as_deref(), Some("v2"));
+
+        // 未重置：小计与累计一致，计入全部历史
+        insert_at(100, Some("2001-01-01 00:00:00"));
+        insert_at(50, Some("2020-06-01 12:00:00"));
+        let t = trip_stats(&conn).unwrap();
+        assert!(t.started_at.is_none());
+        assert_eq!(t.stats.total_tokens, 150);
+        assert_eq!(t.stats.requests, 2);
+
+        // 重置：起点为当前时间；两条旧时间消息均不计入
+        let t = reset_trip(&conn).unwrap();
+        assert!(t.started_at.is_some());
+        assert_eq!(t.stats.total_tokens, 0);
+        assert_eq!(t.stats.requests, 0);
+
+        // 起点之前的不计入，之后（落库即当前时间）的计入
+        insert_at(30, Some("2001-01-01 00:00:00"));
+        insert_at(70, None);
+        let t = trip_stats(&conn).unwrap();
+        assert_eq!(t.stats.total_tokens, 70);
+        assert_eq!(t.stats.requests, 1);
+
+        // 累计统计不受重置影响
+        let g = global_stats(&conn).unwrap();
+        assert_eq!(g.total_tokens, 250);
+        assert_eq!(g.requests, 4);
     }
 
     #[test]
