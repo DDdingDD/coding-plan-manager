@@ -11,19 +11,7 @@
         <a-statistic title="累计 Token" :value="stats.total_tokens" style="margin-bottom: 4px" />
         <a-statistic title="累计请求" :value="stats.requests" />
         <a-divider style="margin: 8px 0" />
-        <div class="trip-header">
-          <span class="trip-title" :title="tripTitle">小计{{ tripStartLabel }}</span>
-          <a-popconfirm
-            title="重置小计统计？"
-            ok-text="重置"
-            cancel-text="取消"
-            @confirm="doResetTrip"
-          >
-            <a-button size="small" type="text" class="trip-reset">重置</a-button>
-          </a-popconfirm>
-        </div>
-        <a-statistic title="小计 Token" :value="trip.stats.total_tokens" style="margin-bottom: 4px" />
-        <a-statistic title="小计请求" :value="trip.stats.requests" />
+        <TripGauge :trip="trip" @reset="doResetTrip" />
       </div>
     </a-layout-sider>
     <a-layout-content style="padding: 16px; overflow: auto">
@@ -36,7 +24,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, h, onMounted, onUnmounted, ref, watch, type Component } from "vue";
+import { h, onMounted, onUnmounted, ref, watch, type Component } from "vue";
 import {
   ApiOutlined,
   BarChartOutlined,
@@ -49,6 +37,7 @@ import PlansPage from "./pages/PlansPage.vue";
 import AggregatorsPage from "./pages/AggregatorsPage.vue";
 import MessagesPage from "./pages/MessagesPage.vue";
 import StatsPage from "./pages/StatsPage.vue";
+import TripGauge from "./components/TripGauge.vue";
 import { globalStats, onNewMessage, resetTrip, tripStats } from "./api";
 import { debounce } from "./utils";
 import type { TripStats, UsageStats } from "./types";
@@ -93,13 +82,6 @@ const emptyTrip: TripStats = {
   stats: { ...stats.value },
 };
 const trip = ref<TripStats>(emptyTrip);
-
-const tripStartLabel = computed(() =>
-  trip.value.started_at ? ` · 自 ${trip.value.started_at.slice(5, 16)}` : " · 未重置",
-);
-const tripTitle = computed(() =>
-  trip.value.started_at ? `自 ${trip.value.started_at} 起` : "尚未重置，计入全部历史",
-);
 
 const refreshStats = () =>
   Promise.all([globalStats(), tripStats()]).then(([g, t]) => {
