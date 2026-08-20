@@ -71,11 +71,18 @@ pub fn trip_stats(state: tauri::State<'_, AppState>) -> Result<TripStats, String
     db::trip_stats(&conn).map_err(e2s)
 }
 
-/// 重置小计里程（起点改为当前时间，不影响累计统计）
+/// 重置小计里程（起点改为当前时间并清除暂停状态，不影响累计统计）
 #[tauri::command]
 pub fn reset_trip(state: tauri::State<'_, AppState>) -> Result<TripStats, String> {
     let conn = lock(&state);
     db::reset_trip(&conn).map_err(e2s)
+}
+
+/// 暂停/继续小计里程（暂停期间的用量不补计，不影响累计统计）
+#[tauri::command]
+pub fn toggle_trip_pause(state: tauri::State<'_, AppState>) -> Result<TripStats, String> {
+    let conn = lock(&state);
+    db::toggle_trip_pause(&conn).map_err(e2s)
 }
 
 /// 按天统计（近 days 天，缺省 30）

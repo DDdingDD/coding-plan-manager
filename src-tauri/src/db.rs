@@ -113,9 +113,11 @@ pub struct UsageStats {
 }
 
 /// 小计里程：自上次手动重置以来的用量统计（started_at 为 None 表示从未重置，计入全部历史）
+/// paused 为 true 时统计冻结在暂停时刻，暂停期间的用量不补计
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TripStats {
     pub started_at: Option<String>,
+    pub paused: bool,
     pub stats: UsageStats,
 }
 
@@ -480,26 +482,27 @@ pub fn reset_binding_usage(conn: &Connection, aggregator_id: i64) -> Result<usiz
 // 统计
 // ---------------------------------------------------------------------------
 
+const STATS_SELECT: &str = "SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0),
+        COALESCE(SUM(completion_tokens),0), COALESCE(SUM(cache_read_tokens),0),
+        COALESCE(SUM(cache_creation_tokens),0), COUNT(*)
+ FROM messages";
+
+fn row_to_usage(row: &rusqlite::Row) -> Result<UsageStats> {
+    Ok(UsageStats {
+        total_tokens: row.get(0)?,
+        prompt_tokens: row.get(1)?,
+        completion_tokens: row.get(2)?,
+        cache_read_tokens: row.get(3)?,
+        cache_creation_tokens: row.get(4)?,
+        requests: row.get(5)?,
+    })
+}
+
 fn stats_query(conn: &Connection, where_clause: &str, param: Option<&dyn ToSql>) -> Result<UsageStats> {
-    let sql = format!(
-        "SELECT COALESCE(SUM(total_tokens),0), COALESCE(SUM(prompt_tokens),0),
-                COALESCE(SUM(completion_tokens),0), COALESCE(SUM(cache_read_tokens),0),
-                COALESCE(SUM(cache_creation_tokens),0), COUNT(*)
-         FROM messages {where_clause}"
-    );
-    let read = |row: &rusqlite::Row| -> Result<UsageStats> {
-        Ok(UsageStats {
-            total_tokens: row.get(0)?,
-            prompt_tokens: row.get(1)?,
-            completion_tokens: row.get(2)?,
-            cache_read_tokens: row.get(3)?,
-            cache_creation_tokens: row.get(4)?,
-            requests: row.get(5)?,
-        })
-    };
+    let sql = format!("{STATS_SELECT} {where_clause}");
     match param {
-        Some(v) => conn.query_row(&sql, params![v], read),
-        None => conn.query_row(&sql, [], read),
+        Some(v) => conn.query_row(&sql, params![v], row_to_usage),
+        None => conn.query_row(&sql, [], row_to_usage),
     }
 }
 
@@ -521,6 +524,10 @@ pub fn global_stats(conn: &Connection) -> Result<UsageStats> {
 
 /// settings 表中记录小计起点时间的键，值为 created_at 同格式的本地时间串
 pub const SETTING_TRIP_STARTED_AT: &str = "trip_started_at";
+/// 暂停时刻（键存在即处于暂停中，统计冻结在该时刻之前）
+pub const SETTING_TRIP_PAUSED_AT: &str = "trip_paused_at";
+/// 已闭合暂停区间的 JSON 数组 [[start, end], ...]，半开区间语义
+pub const SETTING_TRIP_PAUSES: &str = "trip_pauses";
 
 pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     conn.query_row("SELECT value FROM settings WHERE key=?1", params![key], |row| {
@@ -538,19 +545,84 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// 小计统计：从未重置（起点为 NULL）时计入全部历史，与累计一致
-pub fn trip_stats(conn: &Connection) -> Result<TripStats> {
-    let started_at = get_setting(conn, SETTING_TRIP_STARTED_AT)?;
-    let stats = match started_at.as_deref() {
-        Some(since) => stats_query(conn, "WHERE created_at>=?1", Some(&since))?,
-        None => stats_query(conn, "", None)?,
-    };
-    Ok(TripStats { started_at, stats })
+fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
+    conn.execute("DELETE FROM settings WHERE key=?1", params![key])?;
+    Ok(())
 }
 
-/// 重置小计：起点改为当前时间（不改任何消息数据，累计统计不受影响）
+/// 已闭合的暂停区间列表（JSON 损坏时按无区间处理，避免统计整体崩掉）
+fn get_trip_pauses(conn: &Connection) -> Result<Vec<(String, String)>> {
+    Ok(match get_setting(conn, SETTING_TRIP_PAUSES)? {
+        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+        None => Vec::new(),
+    })
+}
+
+/// 小计统计：从未重置（起点为 NULL）时计入全部历史；暂停区间的用量不计入；
+/// 暂停中冻结在暂停时刻（暂停期间的用量即使恢复后也不补计）
+pub fn trip_stats(conn: &Connection) -> Result<TripStats> {
+    let started_at = get_setting(conn, SETTING_TRIP_STARTED_AT)?;
+    let paused_at = get_setting(conn, SETTING_TRIP_PAUSED_AT)?;
+    let pauses = get_trip_pauses(conn)?;
+
+    let mut conds: Vec<String> = Vec::new();
+    let mut values: Vec<String> = Vec::new();
+    if let Some(since) = &started_at {
+        values.push(since.clone());
+        conds.push(format!("created_at>=?{}", values.len()));
+    }
+    for (start, end) in &pauses {
+        // 半开区间 [start, end)：暂停瞬间的消息不计，恢复瞬间的计
+        values.push(start.clone());
+        values.push(end.clone());
+        conds.push(format!(
+            "(created_at<?{} OR created_at>=?{})",
+            values.len() - 1,
+            values.len()
+        ));
+    }
+    if let Some(pa) = &paused_at {
+        values.push(pa.clone());
+        conds.push(format!("created_at<?{}", values.len()));
+    }
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conds.join(" AND "))
+    };
+    let stats = conn.query_row(
+        &format!("{STATS_SELECT} {where_clause}"),
+        rusqlite::params_from_iter(values.iter()),
+        row_to_usage,
+    )?;
+    Ok(TripStats {
+        started_at,
+        paused: paused_at.is_some(),
+        stats,
+    })
+}
+
+/// 暂停/继续小计：暂停时记暂停时刻；继续时把 [paused_at, now) 并入闭合区间
+pub fn toggle_trip_pause(conn: &Connection) -> Result<TripStats> {
+    match get_setting(conn, SETTING_TRIP_PAUSED_AT)? {
+        None => set_setting(conn, SETTING_TRIP_PAUSED_AT, &now_str())?,
+        Some(paused_at) => {
+            let mut pauses = get_trip_pauses(conn)?;
+            pauses.push((paused_at, now_str()));
+            let json = serde_json::to_string(&pauses)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            set_setting(conn, SETTING_TRIP_PAUSES, &json)?;
+            delete_setting(conn, SETTING_TRIP_PAUSED_AT)?;
+        }
+    }
+    trip_stats(conn)
+}
+
+/// 重置小计：起点改为当前时间并清除暂停状态（不改任何消息数据，累计统计不受影响）
 pub fn reset_trip(conn: &Connection) -> Result<TripStats> {
     set_setting(conn, SETTING_TRIP_STARTED_AT, &now_str())?;
+    delete_setting(conn, SETTING_TRIP_PAUSED_AT)?;
+    delete_setting(conn, SETTING_TRIP_PAUSES)?;
     trip_stats(conn)
 }
 
@@ -984,6 +1056,94 @@ mod tests {
         let g = global_stats(&conn).unwrap();
         assert_eq!(g.total_tokens, 250);
         assert_eq!(g.requests, 4);
+    }
+
+    #[test]
+    fn trip_pause() {
+        let conn = mem();
+        let agg = create_aggregator(&conn, "g1", 8301, "cpm-x", 100).unwrap();
+        let insert_at = |total: i64, created: &str| {
+            insert_message(
+                &conn,
+                &NewMessage {
+                    aggregator_id: agg.id,
+                    plan_id: None,
+                    method: "POST".into(),
+                    path: "/v1/messages".into(),
+                    status: 200,
+                    request_body: "".into(),
+                    response_body: "".into(),
+                    model: "glm-4.7".into(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    total_tokens: total,
+                    duration_ms: 1,
+                },
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE messages SET created_at=?1 WHERE id=(SELECT MAX(id) FROM messages)",
+                params![created],
+            )
+            .unwrap();
+        };
+
+        // 固定 2020 年时间线（手工写 settings，避免真实时钟秒级竞争）：
+        //   00:30 计数中 A=100；01:00 暂停（P=10）；02:00 暂停期间 B=50；
+        //   03:00 恢复（R=20）；04:00 恢复后 C=70
+        set_setting(&conn, SETTING_TRIP_STARTED_AT, "2020-01-01 00:00:00").unwrap();
+        insert_at(100, "2020-01-01 00:30:00");
+        let t = trip_stats(&conn).unwrap();
+        assert!(!t.paused);
+        assert_eq!(t.stats.total_tokens, 100);
+
+        // 暂停：冻结在 01:00 之前，之后的消息不计入
+        set_setting(&conn, SETTING_TRIP_PAUSED_AT, "2020-01-01 01:00:00").unwrap();
+        insert_at(10, "2020-01-01 01:00:00"); // 暂停瞬间（含）
+        insert_at(50, "2020-01-01 02:00:00"); // 暂停期间
+        let t = trip_stats(&conn).unwrap();
+        assert!(t.paused);
+        assert_eq!(t.stats.total_tokens, 100);
+        assert_eq!(t.stats.requests, 1);
+
+        // 继续：闭合区间 [01:00, 03:00)，区间内消息不补计；恢复瞬间及之后的计入
+        set_setting(
+            &conn,
+            SETTING_TRIP_PAUSES,
+            "[[\"2020-01-01 01:00:00\",\"2020-01-01 03:00:00\"]]",
+        )
+        .unwrap();
+        delete_setting(&conn, SETTING_TRIP_PAUSED_AT).unwrap();
+        insert_at(20, "2020-01-01 03:00:00"); // 恢复瞬间（含）
+        insert_at(70, "2020-01-01 04:00:00");
+        let t = trip_stats(&conn).unwrap();
+        assert!(!t.paused);
+        assert_eq!(t.stats.total_tokens, 190);
+        assert_eq!(t.stats.requests, 3);
+
+        // 累计统计不受暂停影响（双轨）
+        let g = global_stats(&conn).unwrap();
+        assert_eq!(g.total_tokens, 250);
+        assert_eq!(g.requests, 5);
+
+        // toggle 状态机（真实时钟，只断言状态与区间记录，不断言 token 边界）
+        let t = toggle_trip_pause(&conn).unwrap();
+        assert!(t.paused);
+        let t = toggle_trip_pause(&conn).unwrap();
+        assert!(!t.paused);
+        let raw = get_setting(&conn, SETTING_TRIP_PAUSES).unwrap().unwrap();
+        let pauses: Vec<(String, String)> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(pauses.len(), 2, "手工区间 + toggle 闭合区间");
+
+        // 暂停中重置：清零并回到计数中，暂停状态一并清除
+        toggle_trip_pause(&conn).unwrap();
+        let t = reset_trip(&conn).unwrap();
+        assert!(!t.paused);
+        assert_eq!(t.stats.total_tokens, 0);
+        assert!(get_setting(&conn, SETTING_TRIP_PAUSED_AT).unwrap().is_none());
+        assert!(get_setting(&conn, SETTING_TRIP_PAUSES).unwrap().is_none());
     }
 
     #[test]

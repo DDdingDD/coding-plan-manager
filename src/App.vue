@@ -11,7 +11,7 @@
         <a-statistic title="累计 Token" :value="stats.total_tokens" style="margin-bottom: 4px" />
         <a-statistic title="累计请求" :value="stats.requests" />
         <a-divider style="margin: 8px 0" />
-        <TripGauge :trip="trip" @reset="doResetTrip" />
+        <TripGauge :trip="trip" @reset="doResetTrip" @toggle-pause="doTogglePause" />
       </div>
     </a-layout-sider>
     <a-layout-content style="padding: 16px; overflow: auto">
@@ -38,7 +38,7 @@ import AggregatorsPage from "./pages/AggregatorsPage.vue";
 import MessagesPage from "./pages/MessagesPage.vue";
 import StatsPage from "./pages/StatsPage.vue";
 import TripGauge from "./components/TripGauge.vue";
-import { globalStats, onNewMessage, resetTrip, tripStats } from "./api";
+import { globalStats, onNewMessage, resetTrip, toggleTripPause, tripStats } from "./api";
 import { debounce } from "./utils";
 import type { TripStats, UsageStats } from "./types";
 
@@ -76,9 +76,10 @@ const stats = ref<UsageStats>({
   requests: 0,
 });
 
-// 小计里程：自上次手动重置以来的用量（未重置时与累计一致）
+// 小计里程：自上次手动重置以来的用量（未重置时与累计一致）；paused 时统计冻结
 const emptyTrip: TripStats = {
   started_at: null,
+  paused: false,
   stats: { ...stats.value },
 };
 const trip = ref<TripStats>(emptyTrip);
@@ -93,6 +94,14 @@ async function doResetTrip() {
   try {
     trip.value = await resetTrip();
     message.success("小计已重置");
+  } catch (e) {
+    message.error(String(e));
+  }
+}
+
+async function doTogglePause() {
+  try {
+    trip.value = await toggleTripPause();
   } catch (e) {
     message.error(String(e));
   }

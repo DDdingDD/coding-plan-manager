@@ -42,6 +42,7 @@ pub fn run() {
             commands::messages::global_stats,
             commands::messages::trip_stats,
             commands::messages::reset_trip,
+            commands::messages::toggle_trip_pause,
             commands::messages::daily_stats,
             commands::messages::hourly_stats,
             commands::messages::model_stats,

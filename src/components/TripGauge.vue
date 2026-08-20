@@ -1,18 +1,17 @@
 <template>
   <div class="trip-gauge-wrap">
-    <a-popconfirm
-      title="重置小计统计？"
-      ok-text="重置"
-      cancel-text="取消"
-      @confirm="$emit('reset')"
+    <div
+      class="trip-gauge"
+      :class="{ paused: trip.paused }"
+      :title="gaugeTitle"
+      @click="onClick"
+      @dblclick="onDblClick"
     >
-      <div class="trip-gauge" :title="gaugeTitle">
-        <div class="gauge-label">小计</div>
-        <div class="gauge-value">{{ displayTokens }}</div>
-        <div class="gauge-unit">tokens</div>
-        <div class="gauge-requests">{{ displayRequests }} 次请求</div>
-      </div>
-    </a-popconfirm>
+      <div class="gauge-label">{{ trip.paused ? "已暂停" : "小计" }}</div>
+      <div class="gauge-value">{{ displayTokens }}</div>
+      <div class="gauge-unit">tokens</div>
+      <div class="gauge-requests">{{ displayRequests }} 次请求</div>
+    </div>
     <div class="gauge-start">{{ tripStartLabel }}</div>
   </div>
 </template>
@@ -22,7 +21,27 @@ import { computed, onUnmounted, ref, watch, toRef, type Ref } from "vue";
 import type { TripStats } from "../types";
 
 const props = defineProps<{ trip: TripStats }>();
-defineEmits<{ (e: "reset"): void }>();
+const emit = defineEmits<{ (e: "reset"): void; (e: "toggle-pause"): void }>();
+
+// 单击=暂停/继续，双击=重置：单击延迟 250ms 等待是否构成双击
+let clickTimer: ReturnType<typeof setTimeout> | null = null;
+function onClick() {
+  if (clickTimer) return; // 双击的第二击，由 dblclick 处理
+  clickTimer = setTimeout(() => {
+    clickTimer = null;
+    emit("toggle-pause");
+  }, 250);
+}
+function onDblClick() {
+  if (clickTimer) {
+    clearTimeout(clickTimer);
+    clickTimer = null;
+  }
+  emit("reset");
+}
+onUnmounted(() => {
+  if (clickTimer) clearTimeout(clickTimer);
+});
 
 /** 数字滚动过渡：source 变化时从当前显示值 rAF 插值到新值（easeOutCubic），连击不跳变 */
 function useTweenedNumber(source: Ref<number>, duration = 600) {
@@ -66,7 +85,8 @@ const gaugeTitle = computed(() => {
   const since = props.trip.started_at
     ? `自 ${props.trip.started_at} 起`
     : "尚未重置，计入全部历史";
-  return `${exact}\n${since}\n点击重置小计`;
+  const state = props.trip.paused ? "已暂停（暂停期间的用量不计入）" : "计数中";
+  return `${exact}\n${since} · ${state}\n单击暂停/继续 · 双击重置`;
 });
 </script>
 
@@ -103,10 +123,27 @@ const gaugeTitle = computed(() => {
 .trip-gauge:active {
   transform: scale(0.96);
 }
+/* 暂停态：琥珀边框 + 灰数字，与计数中（蓝）区分 */
+.trip-gauge.paused {
+  border-color: #faad14;
+}
+.trip-gauge.paused:hover {
+  border-color: #faad14;
+  box-shadow:
+    inset 0 0 12px rgba(0, 0, 0, 0.04),
+    0 0 0 3px rgba(250, 173, 20, 0.15);
+}
+.trip-gauge.paused .gauge-value {
+  color: #8c8c8c;
+}
+.trip-gauge.paused .gauge-label {
+  color: #faad14;
+}
 .gauge-label {
   font-size: 11px;
   color: #8c8c8c;
   letter-spacing: 2px;
+  transition: color 0.15s;
 }
 .gauge-value {
   font-size: 22px;
@@ -118,6 +155,7 @@ const gaugeTitle = computed(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: color 0.15s;
 }
 .gauge-unit {
   font-size: 11px;

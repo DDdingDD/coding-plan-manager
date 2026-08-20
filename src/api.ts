@@ -125,6 +125,9 @@ export const tripStats = () => invoke<TripStats>("trip_stats");
 /** 重置小计里程（不影响累计统计） */
 export const resetTrip = () => invoke<TripStats>("reset_trip");
 
+/** 暂停/继续小计里程（暂停期间的用量不补计） */
+export const toggleTripPause = () => invoke<TripStats>("toggle_trip_pause");
+
 /** 按天统计（近 days 天） */
 export const dailyStats = (p: { aggregatorId?: number | null; days?: number } = {}) =>
   invoke<StatsBucket[]>("daily_stats", {
