@@ -188,7 +188,7 @@ async fn wait_for_messages(conn: &Conn, agg_id: i64, min: i64) {
     panic!("消息未在预期时间内落库");
 }
 
-/// 初始化内存库 + 聚合器（按 plan_tokens 顺序绑定各计划），返回 (连接, 路由, 聚合器 id)
+/// 初始化内存库 + 聚合器（按 plan_tokens 顺序绑定各计划，阈值轮转策略），返回 (连接, 路由, 聚合器 id)
 async fn setup_router(
     upstream: &str,
     plan_tokens: &[&str],
@@ -202,9 +202,21 @@ async fn setup_router(
         let plan_ids: Vec<i64> = plan_tokens
             .iter()
             .enumerate()
-            .map(|(i, t)| db::create_plan(&c, &format!("P{i}"), upstream, t, "").unwrap().id)
+            .map(|(i, t)| {
+                db::create_plan(&c, &format!("P{i}"), upstream, t, "", &[])
+                    .unwrap()
+                    .id
+            })
             .collect();
-        let agg = db::create_aggregator(&c, "g", port, agg_token, threshold).unwrap();
+        let agg = db::create_aggregator(
+            &c,
+            "g",
+            port,
+            agg_token,
+            threshold,
+            db::STRATEGY_THRESHOLD_ROTATION,
+        )
+        .unwrap();
         db::set_aggregator_plans(&c, agg.id, &plan_ids).unwrap();
         agg.id
     };
@@ -229,10 +241,18 @@ async fn e2e_auth_rotation_stats_and_wraparound() {
     let conn: Conn = Arc::new(Mutex::new(db::init_db(":memory:").unwrap()));
     let (pa, pb, agg) = {
         let c = lock(&conn);
-        let pa = db::create_plan(&c, "A", &upstream, "tokA", "").unwrap();
-        let pb = db::create_plan(&c, "B", &upstream, "tokB", "").unwrap();
+        let pa = db::create_plan(&c, "A", &upstream, "tokA", "", &[]).unwrap();
+        let pb = db::create_plan(&c, "B", &upstream, "tokB", "", &[]).unwrap();
         // 阈值 100，每响应 total=60
-        let agg = db::create_aggregator(&c, "g", 8300, "cpm-test", 100).unwrap();
+        let agg = db::create_aggregator(
+            &c,
+            "g",
+            8300,
+            "cpm-test",
+            100,
+            db::STRATEGY_THRESHOLD_ROTATION,
+        )
+        .unwrap();
         db::set_aggregator_plans(&c, agg.id, &[pa.id, pb.id]).unwrap();
         (pa, pb, agg)
     };
@@ -264,10 +284,20 @@ async fn e2e_auth_rotation_stats_and_wraparound() {
         let seq: Vec<&str> = cap.iter().map(|s| s.split('|').next().unwrap()).collect();
         assert_eq!(
             seq,
-            vec!["Bearer tokA", "Bearer tokA", "Bearer tokB", "Bearer tokB", "Bearer tokA"],
+            vec![
+                "Bearer tokA",
+                "Bearer tokA",
+                "Bearer tokB",
+                "Bearer tokB",
+                "Bearer tokA"
+            ],
             "阈值轮转序列应为 A A B B A"
         );
-        assert!(cap[0].ends_with("|tokA"), "应同时注入 x-api-key: {}", cap[0]);
+        assert!(
+            cap[0].ends_with("|tokA"),
+            "应同时注入 x-api-key: {}",
+            cap[0]
+        );
     }
 
     // 4) 统计：A 承接 r1/r2/r5=180，B 承接 r3/r4=120；绑定用量 A 清零回绕后=60，B=120
@@ -289,7 +319,9 @@ async fn e2e_auth_rotation_stats_and_wraparound() {
         assert_eq!(total, 6);
         let ok_rows: Vec<_> = items.iter().filter(|m| m.status == 200).collect();
         assert_eq!(ok_rows.len(), 5);
-        assert!(ok_rows.iter().all(|m| m.plan_name.as_deref() == Some("A") || m.plan_name.as_deref() == Some("B")));
+        assert!(ok_rows
+            .iter()
+            .all(|m| m.plan_name.as_deref() == Some("A") || m.plan_name.as_deref() == Some("B")));
         assert!(items.iter().any(|m| m.status == 401 && m.plan_id.is_none()));
 
         let gs = db::global_stats(&c).unwrap();
@@ -306,8 +338,16 @@ async fn e2e_sse_stream_usage() {
     let conn: Conn = Arc::new(Mutex::new(db::init_db(":memory:").unwrap()));
     let agg = {
         let c = lock(&conn);
-        let p = db::create_plan(&c, "S", &upstream, "tokS", "").unwrap();
-        let agg = db::create_aggregator(&c, "g", 8301, "cpm-sse", 1000).unwrap();
+        let p = db::create_plan(&c, "S", &upstream, "tokS", "", &[]).unwrap();
+        let agg = db::create_aggregator(
+            &c,
+            "g",
+            8301,
+            "cpm-sse",
+            1000,
+            db::STRATEGY_THRESHOLD_ROTATION,
+        )
+        .unwrap();
         db::set_aggregator_plans(&c, agg.id, &[p.id]).unwrap();
         agg
     };
@@ -331,7 +371,10 @@ async fn e2e_sse_stream_usage() {
     let (_, items) = db::list_messages(&c, Some(agg.id), 5, 0).unwrap();
     let m = items.iter().find(|m| m.status == 200).unwrap();
     assert_eq!(m.prompt_tokens, 30);
-    assert_eq!(m.completion_tokens, 9, "message_delta 的 output_tokens 应覆盖 message_start 的初始值");
+    assert_eq!(
+        m.completion_tokens, 9,
+        "message_delta 的 output_tokens 应覆盖 message_start 的初始值"
+    );
     assert_eq!(m.total_tokens, 39);
     let bindings = db::list_bindings(&c, agg.id).unwrap();
     assert_eq!(bindings[0].used_tokens, 39, "绑定用量应累加 39");
@@ -344,8 +387,16 @@ async fn e2e_upstream_unreachable_502() {
     let agg = {
         let c = lock(&conn);
         // 端口 1 几乎必然无服务
-        let p = db::create_plan(&c, "dead", "http://127.0.0.1:1", "tokD", "").unwrap();
-        let agg = db::create_aggregator(&c, "g", 8302, "cpm-502", 1000).unwrap();
+        let p = db::create_plan(&c, "dead", "http://127.0.0.1:1", "tokD", "", &[]).unwrap();
+        let agg = db::create_aggregator(
+            &c,
+            "g",
+            8302,
+            "cpm-502",
+            1000,
+            db::STRATEGY_THRESHOLD_ROTATION,
+        )
+        .unwrap();
         db::set_aggregator_plans(&c, agg.id, &[p.id]).unwrap();
         agg
     };
@@ -378,7 +429,15 @@ async fn e2e_no_plan_503() {
     let conn: Conn = Arc::new(Mutex::new(db::init_db(":memory:").unwrap()));
     let agg = {
         let c = lock(&conn);
-        db::create_aggregator(&c, "g", 8303, "cpm-503", 1000).unwrap()
+        db::create_aggregator(
+            &c,
+            "g",
+            8303,
+            "cpm-503",
+            1000,
+            db::STRATEGY_THRESHOLD_ROTATION,
+        )
+        .unwrap()
     };
 
     let shared = Arc::new(ProxyShared {
@@ -402,8 +461,16 @@ async fn e2e_tcp_server_start_stop() {
     let conn: Conn = Arc::new(Mutex::new(db::init_db(":memory:").unwrap()));
     let agg = {
         let c = lock(&conn);
-        let p = db::create_plan(&c, "T", &upstream, "tokT", "").unwrap();
-        let agg = db::create_aggregator(&c, "g", 8305, "cpm-tcp", 1000).unwrap();
+        let p = db::create_plan(&c, "T", &upstream, "tokT", "", &[]).unwrap();
+        let agg = db::create_aggregator(
+            &c,
+            "g",
+            8305,
+            "cpm-tcp",
+            1000,
+            db::STRATEGY_THRESHOLD_ROTATION,
+        )
+        .unwrap();
         db::set_aggregator_plans(&c, agg.id, &[p.id]).unwrap();
         agg
     };
@@ -488,7 +555,10 @@ async fn e2e_upstream_error_status_passthrough() {
 
     let (status, body) = send(&router, "cpm-err").await;
     assert_eq!(status, 429, "上游状态码应透传");
-    assert!(body.contains("rate_limit_error"), "上游错误体应透传: {body}");
+    assert!(
+        body.contains("rate_limit_error"),
+        "上游错误体应透传: {body}"
+    );
 
     // 非流式分支落库在响应返回前完成；列表行不含体，完整消息经 get_message 拉取
     let c = lock(&conn);
@@ -545,7 +615,10 @@ async fn e2e_header_passthrough_and_strip() {
     assert_eq!(h["x-api-key"], "tokH");
 
     // 跳段头/编码协商头剥离
-    assert!(h.get("accept-encoding").is_none(), "accept-encoding 应被剥离: {h}");
+    assert!(
+        h.get("accept-encoding").is_none(),
+        "accept-encoding 应被剥离: {h}"
+    );
     assert_ne!(h["host"], "evil.example", "客户端原始 host 不应透传");
 }
 
@@ -574,7 +647,8 @@ async fn e2e_get_no_body() {
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_threshold_hot_reload() {
     let (upstream, captured) = spawn_mock_upstream(MockMode::Json).await;
-    let (conn, router, agg_id) = setup_router(&upstream, &["tokA", "tokB"], 8310, "cpm-hot", 100).await;
+    let (conn, router, agg_id) =
+        setup_router(&upstream, &["tokA", "tokB"], 8310, "cpm-hot", 100).await;
 
     // 请求 1：阈值 100，A 从 0 起步 -> 选 A（用后 60）
     let (status, _) = send(&router, "cpm-hot").await;
@@ -584,11 +658,15 @@ async fn e2e_threshold_hot_reload() {
     // 热更新：阈值降到 60，A 已用 60 -> 下一请求应切到 B（服务未重启）
     {
         let c = lock(&conn);
-        db::update_aggregator(&c, agg_id, "g", 8310, 60).unwrap();
+        db::update_aggregator(&c, agg_id, "g", 8310, 60, db::STRATEGY_THRESHOLD_ROTATION).unwrap();
     }
     let (status, _) = send(&router, "cpm-hot").await;
     assert_eq!(status, 200);
-    assert_eq!(captured.lock().unwrap()[1], "Bearer tokB|tokB", "阈值修改应即时生效");
+    assert_eq!(
+        captured.lock().unwrap()[1],
+        "Bearer tokB|tokB",
+        "阈值修改应即时生效"
+    );
 }
 
 /// prompt caching：cache_read/cache_creation 解析入库并计入 total（原始 token 口径）与绑定用量
@@ -607,7 +685,11 @@ async fn e2e_cache_tokens_counted() {
     assert_eq!(m.prompt_tokens, 50, "input_tokens 不含缓存部分");
     assert_eq!(m.cache_read_tokens, 900);
     assert_eq!(m.cache_creation_tokens, 40);
-    assert_eq!(m.total_tokens, 50 + 900 + 40 + 10, "total 应按原始口径合计四项");
+    assert_eq!(
+        m.total_tokens,
+        50 + 900 + 40 + 10,
+        "total 应按原始口径合计四项"
+    );
 
     // 绑定用量（轮转计数）同样按含缓存的 total 累加
     let bindings = db::list_bindings(&c, agg_id).unwrap();
@@ -618,4 +700,107 @@ async fn e2e_cache_tokens_counted() {
     assert_eq!(s.cache_read_tokens, 900);
     assert_eq!(s.cache_creation_tokens, 40);
     assert_eq!(s.total_tokens, 1000);
+}
+
+/// 模型匹配策略：按请求模型路由到配置了该「支持模型」的计划，
+/// 切换后持久化（粘性），无匹配（未知模型/未携带模型）走当前计划
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_model_match_routing() {
+    let (upstream, captured) = spawn_mock_upstream(MockMode::Json).await;
+
+    let conn: Conn = Arc::new(Mutex::new(db::init_db(":memory:").unwrap()));
+    let (pa, pb, agg) = {
+        let c = lock(&conn);
+        let pa = db::create_plan(&c, "A", &upstream, "tokA", "", &["glm-4.7".into()]).unwrap();
+        let pb = db::create_plan(&c, "B", &upstream, "tokB", "", &["claude-x".into()]).unwrap();
+        let agg = db::create_aggregator(
+            &c,
+            "g",
+            8312,
+            "cpm-model",
+            1_000_000,
+            db::STRATEGY_MODEL_MATCH,
+        )
+        .unwrap();
+        db::set_aggregator_plans(&c, agg.id, &[pa.id, pb.id]).unwrap();
+        (pa, pb, agg)
+    };
+
+    let shared = Arc::new(ProxyShared {
+        aggregator_id: agg.id,
+        db: conn.clone(),
+        client: reqwest::Client::new(),
+        app: None,
+    });
+    let router = proxy::build_router(shared);
+
+    let send_model = |model: &str| {
+        let router = router.clone();
+        let model = model.to_string();
+        async move {
+            send_raw(
+                &router,
+                "POST",
+                "/v1/messages",
+                &[("authorization", "Bearer cpm-model".to_string())],
+                &format!(r#"{{"model":"{model}","stream":false}}"#),
+            )
+            .await
+        }
+    };
+
+    // 1) claude-x 匹配 B（当前计划未设置，匹配集即 [B]）-> B 并固化为当前
+    let (status, body) = send_model("claude-x").await;
+    assert_eq!(status, 200, "转发应成功: {body}");
+    assert_eq!(captured.lock().unwrap()[0], "Bearer tokB|tokB");
+
+    // 2) glm-4.7 匹配 A，当前 B 不在匹配集中 -> 切到 A 并持久化
+    let (status, _) = send_model("glm-4.7").await;
+    assert_eq!(status, 200);
+    assert_eq!(captured.lock().unwrap()[1], "Bearer tokA|tokA");
+
+    // 3) 未知模型无匹配 -> 走当前计划 A
+    let (status, _) = send_model("unknown-model").await;
+    assert_eq!(status, 200);
+    assert_eq!(captured.lock().unwrap()[2], "Bearer tokA|tokA");
+
+    // 4) claude-x 再次匹配 -> 切回 B
+    let (status, _) = send_model("claude-x").await;
+    assert_eq!(status, 200);
+    assert_eq!(captured.lock().unwrap()[3], "Bearer tokB|tokB");
+    {
+        let c = lock(&conn);
+        let got = db::get_aggregator(&c, agg.id).unwrap().unwrap();
+        assert_eq!(got.current_plan_id, Some(pb.id), "切换应持久化为新当前计划");
+    }
+
+    // 5) 粘性：同模型重复请求不再切换；消息按模型归属对应计划
+    let (status, _) = send_model("glm-4.7").await;
+    assert_eq!(status, 200);
+    assert_eq!(captured.lock().unwrap()[4], "Bearer tokA|tokA");
+    {
+        let c = lock(&conn);
+        let got = db::get_aggregator(&c, agg.id).unwrap().unwrap();
+        assert_eq!(got.current_plan_id, Some(pa.id));
+
+        let (_, items) = db::list_messages(&c, Some(agg.id), 10, 0).unwrap();
+        assert_eq!(items.len(), 5);
+        // 列表按 id 倒序，反转为时间正序后核对 (model, plan) 归属
+        let mut seq: Vec<(String, String)> = items
+            .iter()
+            .map(|m| (m.model.clone(), m.plan_name.clone().unwrap_or_default()))
+            .collect();
+        seq.reverse();
+        assert_eq!(
+            seq,
+            vec![
+                ("claude-x".into(), "B".into()),
+                ("glm-4.7".into(), "A".into()),
+                ("unknown-model".into(), "A".into()),
+                ("claude-x".into(), "B".into()),
+                ("glm-4.7".into(), "A".into()),
+            ],
+            "消息的计划归属应与模型匹配路由一致"
+        );
+    }
 }

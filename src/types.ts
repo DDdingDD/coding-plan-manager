@@ -33,6 +33,8 @@ export interface CodingPlan {
   base_url: string;
   auth_token: string;
   remark: string;
+  /** 支持的模型名列表（空 = 未配置，模型匹配策略下不参与匹配） */
+  models: string[];
   enabled: boolean;
   created_at: string;
 }
@@ -59,6 +61,8 @@ export interface BindingView {
   position: number;
   used_tokens: number;
   token_threshold: number;
+  /** 该计划配置的支持模型（模型匹配策略的路由依据） */
+  models: string[];
 }
 
 /** list_aggregators 返回：聚合器字段 + 运行状态 + 绑定 + 统计 */
@@ -69,6 +73,8 @@ export interface AggregatorView extends Aggregator {
   stats: UsageStats;
   /** 当前转发的计划（下一个请求将使用）；无可用计划时为 null */
   current_plan_id: number | null;
+  /** 手动指定的当前计划（DB 原值）：阈值轮转的固定计划（null=自动轮转）、模型匹配的粘性目标 */
+  manual_current_plan_id: number | null;
 }
 
 export interface MessageRow {

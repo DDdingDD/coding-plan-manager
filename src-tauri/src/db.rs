@@ -1,8 +1,34 @@
 use rusqlite::{params, Connection, OptionalExtension, Result, ToSql};
 use serde::{Deserialize, Serialize};
 
-/// 轮转策略标识（当前版本仅实现阈值轮转）
+/// 轮转策略标识：阈值轮转（按绑定顺序 + token 阈值）
 pub const STRATEGY_THRESHOLD_ROTATION: &str = "threshold_rotation";
+/// 轮转策略标识：模型匹配（按请求模型匹配计划的「支持模型」，粘性当前计划）
+pub const STRATEGY_MODEL_MATCH: &str = "model_match";
+
+/// 校验策略标识是否为已知值
+pub fn is_known_strategy(s: &str) -> bool {
+    s == STRATEGY_THRESHOLD_ROTATION || s == STRATEGY_MODEL_MATCH
+}
+
+/// 「支持模型」列的存储格式：逗号分隔的模型名原始串（读取时 split_models 解析）
+fn join_models(models: &[String]) -> String {
+    models
+        .iter()
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 解析「支持模型」列为模型名列表（trim + 去空，保持顺序）
+fn split_models(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|m| m.trim())
+        .filter(|m| !m.is_empty())
+        .map(|m| m.to_string())
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // 数据结构
@@ -15,6 +41,8 @@ pub struct CodingPlan {
     pub base_url: String,
     pub auth_token: String,
     pub remark: String,
+    /// 支持的模型名列表（空 = 未配置，模型匹配策略下不参与匹配）
+    pub models: Vec<String>,
     pub enabled: bool,
     pub created_at: String,
 }
@@ -27,6 +55,11 @@ pub struct Aggregator {
     pub auth_token: String,
     pub strategy: String,
     pub token_threshold: i64,
+    /// 「当前计划」：模型匹配策略的粘性路由目标；阈值轮转策略的手动固定计划
+    /// （NULL = 未固定，自动轮转）。serde skip：AggregatorView 以 flatten 内嵌本结构
+    /// 且自带派生的 current_plan_id / manual_current_plan_id，同时序列化会产生重复 JSON 键
+    #[serde(skip)]
+    pub current_plan_id: Option<i64>,
     pub created_at: String,
 }
 
@@ -150,6 +183,7 @@ pub fn init_db(path: &str) -> Result<Connection> {
             base_url    TEXT NOT NULL,
             auth_token  TEXT NOT NULL,
             remark      TEXT NOT NULL DEFAULT '',
+            models      TEXT NOT NULL DEFAULT '',
             enabled     INTEGER NOT NULL DEFAULT 1,
             created_at  TEXT NOT NULL
         );
@@ -161,6 +195,7 @@ pub fn init_db(path: &str) -> Result<Connection> {
             auth_token      TEXT NOT NULL,
             strategy        TEXT NOT NULL DEFAULT 'threshold_rotation',
             token_threshold INTEGER NOT NULL DEFAULT 1000000,
+            current_plan_id INTEGER,
             created_at      TEXT NOT NULL
         );
 
@@ -211,7 +246,8 @@ pub fn init_db(path: &str) -> Result<Connection> {
     Ok(conn)
 }
 
-/// 旧库增量迁移：messages 表缺列则补（model / 缓存 token 两列）
+/// 旧库增量迁移：缺列则补（messages 的 model/缓存 token、coding_plans 的 models、
+/// aggregators 的 current_plan_id）
 fn migrate(conn: &Connection) -> Result<()> {
     let mut has: Vec<String> = Vec::new();
     {
@@ -222,7 +258,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     if !has.iter().any(|c| c == "model") {
-        conn.execute("ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''", [])?;
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN model TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
     }
     if !has.iter().any(|c| c == "cache_read_tokens") {
         conn.execute(
@@ -233,6 +272,36 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has.iter().any(|c| c == "cache_creation_tokens") {
         conn.execute(
             "ALTER TABLE messages ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    ensure_column(conn, "coding_plans", "models", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "aggregators", "current_plan_id", "INTEGER")?;
+    Ok(())
+}
+
+/// 表缺指定列则补（带类型与默认值的 ADD COLUMN 片段）。
+/// 表本身不存在时跳过（由 init_db 的 CREATE TABLE IF NOT EXISTS 负责）。
+fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !table_exists {
+        return Ok(());
+    }
+    let sql = format!("SELECT name FROM pragma_table_info('{table}') WHERE name=?1");
+    let present = conn
+        .query_row(&sql, params![column], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !present {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
             [],
         )?;
     }
@@ -247,7 +316,7 @@ pub fn now_str() -> String {
 // Coding Plan
 // ---------------------------------------------------------------------------
 
-const PLAN_COLS: &str = "id, name, base_url, auth_token, remark, enabled, created_at";
+const PLAN_COLS: &str = "id, name, base_url, auth_token, remark, models, enabled, created_at";
 
 fn row_to_plan(row: &rusqlite::Row) -> Result<CodingPlan> {
     Ok(CodingPlan {
@@ -256,8 +325,9 @@ fn row_to_plan(row: &rusqlite::Row) -> Result<CodingPlan> {
         base_url: row.get(2)?,
         auth_token: row.get(3)?,
         remark: row.get(4)?,
-        enabled: row.get::<_, i64>(5)? != 0,
-        created_at: row.get(6)?,
+        models: split_models(&row.get::<_, String>(5)?),
+        enabled: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
     })
 }
 
@@ -279,12 +349,14 @@ pub fn create_plan(
     base_url: &str,
     auth_token: &str,
     remark: &str,
+    models: &[String],
 ) -> Result<CodingPlan> {
     let created = now_str();
+    let models_raw = join_models(models);
     conn.execute(
-        "INSERT INTO coding_plans (name, base_url, auth_token, remark, enabled, created_at)
-         VALUES (?1, ?2, ?3, ?4, 1, ?5)",
-        params![name, base_url, auth_token, remark, created],
+        "INSERT INTO coding_plans (name, base_url, auth_token, remark, models, enabled, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+        params![name, base_url, auth_token, remark, models_raw, created],
     )?;
     let id = conn.last_insert_rowid();
     Ok(CodingPlan {
@@ -293,6 +365,7 @@ pub fn create_plan(
         base_url: base_url.to_string(),
         auth_token: auth_token.to_string(),
         remark: remark.to_string(),
+        models: split_models(&models_raw),
         enabled: true,
         created_at: created,
     })
@@ -306,10 +379,11 @@ pub fn update_plan(
     auth_token: &str,
     remark: &str,
     enabled: bool,
+    models: &[String],
 ) -> Result<Option<CodingPlan>> {
     let n = conn.execute(
-        "UPDATE coding_plans SET name=?2, base_url=?3, auth_token=?4, remark=?5, enabled=?6 WHERE id=?1",
-        params![id, name, base_url, auth_token, remark, enabled as i64],
+        "UPDATE coding_plans SET name=?2, base_url=?3, auth_token=?4, remark=?5, models=?6, enabled=?7 WHERE id=?1",
+        params![id, name, base_url, auth_token, remark, join_models(models), enabled as i64],
     )?;
     if n == 0 {
         return Ok(None);
@@ -328,7 +402,8 @@ pub fn delete_plan(conn: &Connection, id: i64) -> Result<usize> {
 // Aggregator
 // ---------------------------------------------------------------------------
 
-const AGG_COLS: &str = "id, name, port, auth_token, strategy, token_threshold, created_at";
+const AGG_COLS: &str =
+    "id, name, port, auth_token, strategy, token_threshold, current_plan_id, created_at";
 
 fn row_to_agg(row: &rusqlite::Row) -> Result<Aggregator> {
     Ok(Aggregator {
@@ -338,7 +413,8 @@ fn row_to_agg(row: &rusqlite::Row) -> Result<Aggregator> {
         auth_token: row.get(3)?,
         strategy: row.get(4)?,
         token_threshold: row.get(5)?,
-        created_at: row.get(6)?,
+        current_plan_id: row.get(6)?,
+        created_at: row.get(7)?,
     })
 }
 
@@ -360,12 +436,13 @@ pub fn create_aggregator(
     port: i64,
     auth_token: &str,
     token_threshold: i64,
+    strategy: &str,
 ) -> Result<Aggregator> {
     let created = now_str();
     conn.execute(
         "INSERT INTO aggregators (name, port, auth_token, strategy, token_threshold, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![name, port, auth_token, STRATEGY_THRESHOLD_ROTATION, token_threshold, created],
+        params![name, port, auth_token, strategy, token_threshold, created],
     )?;
     let id = conn.last_insert_rowid();
     Ok(Aggregator {
@@ -373,8 +450,9 @@ pub fn create_aggregator(
         name: name.to_string(),
         port,
         auth_token: auth_token.to_string(),
-        strategy: STRATEGY_THRESHOLD_ROTATION.to_string(),
+        strategy: strategy.to_string(),
         token_threshold,
+        current_plan_id: None,
         created_at: created,
     })
 }
@@ -385,10 +463,11 @@ pub fn update_aggregator(
     name: &str,
     port: i64,
     token_threshold: i64,
+    strategy: &str,
 ) -> Result<Option<Aggregator>> {
     let n = conn.execute(
-        "UPDATE aggregators SET name=?2, port=?3, token_threshold=?4 WHERE id=?1",
-        params![id, name, port, token_threshold],
+        "UPDATE aggregators SET name=?2, port=?3, token_threshold=?4, strategy=?5 WHERE id=?1",
+        params![id, name, port, token_threshold, strategy],
     )?;
     if n == 0 {
         return Ok(None);
@@ -396,8 +475,30 @@ pub fn update_aggregator(
     get_aggregator(conn, id)
 }
 
+/// 设置「当前计划」（模型匹配=粘性路由目标；阈值轮转=手动固定，失效后由策略自动清除）。
+/// 返回 false 表示聚合器不存在；plan 是否有效由调用方校验。
+pub fn set_current_plan(conn: &Connection, id: i64, plan_id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE aggregators SET current_plan_id=?2 WHERE id=?1",
+        params![id, plan_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// 清除「当前计划」指定（阈值轮转恢复自动轮转；模型匹配回退首个启用绑定并固化）
+pub fn clear_current_plan(conn: &Connection, id: i64) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE aggregators SET current_plan_id=NULL WHERE id=?1",
+        params![id],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn delete_aggregator(conn: &Connection, id: i64) -> Result<usize> {
-    conn.execute("DELETE FROM aggregator_plans WHERE aggregator_id=?1", params![id])?;
+    conn.execute(
+        "DELETE FROM aggregator_plans WHERE aggregator_id=?1",
+        params![id],
+    )?;
     let n = conn.execute("DELETE FROM aggregators WHERE id=?1", params![id])?;
     Ok(n)
 }
@@ -409,7 +510,7 @@ pub fn delete_aggregator(conn: &Connection, id: i64) -> Result<usize> {
 pub fn list_bindings(conn: &Connection, aggregator_id: i64) -> Result<Vec<BindingWithPlan>> {
     let mut stmt = conn.prepare(
         "SELECT ap.id, ap.position, ap.used_tokens,
-                p.id, p.name, p.base_url, p.auth_token, p.remark, p.enabled, p.created_at
+                p.id, p.name, p.base_url, p.auth_token, p.remark, p.models, p.enabled, p.created_at
          FROM aggregator_plans ap
          JOIN coding_plans p ON p.id = ap.plan_id
          WHERE ap.aggregator_id=?1
@@ -426,8 +527,9 @@ pub fn list_bindings(conn: &Connection, aggregator_id: i64) -> Result<Vec<Bindin
                 base_url: row.get(5)?,
                 auth_token: row.get(6)?,
                 remark: row.get(7)?,
-                enabled: row.get::<_, i64>(8)? != 0,
-                created_at: row.get(9)?,
+                models: split_models(&row.get::<_, String>(8)?),
+                enabled: row.get::<_, i64>(9)? != 0,
+                created_at: row.get(10)?,
             },
         })
     })?;
@@ -439,8 +541,8 @@ pub fn set_aggregator_plans(conn: &Connection, aggregator_id: i64, plan_ids: &[i
     // 先取当前 used_tokens 映射
     let mut old_usage = std::collections::HashMap::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT plan_id, used_tokens FROM aggregator_plans WHERE aggregator_id=?1")?;
+        let mut stmt = conn
+            .prepare("SELECT plan_id, used_tokens FROM aggregator_plans WHERE aggregator_id=?1")?;
         let rows = stmt.query_map(params![aggregator_id], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -450,7 +552,10 @@ pub fn set_aggregator_plans(conn: &Connection, aggregator_id: i64, plan_ids: &[i
         }
     }
 
-    conn.execute("DELETE FROM aggregator_plans WHERE aggregator_id=?1", params![aggregator_id])?;
+    conn.execute(
+        "DELETE FROM aggregator_plans WHERE aggregator_id=?1",
+        params![aggregator_id],
+    )?;
     for (idx, pid) in plan_ids.iter().enumerate() {
         let used = old_usage.get(pid).copied().unwrap_or(0);
         conn.execute(
@@ -498,7 +603,11 @@ fn row_to_usage(row: &rusqlite::Row) -> Result<UsageStats> {
     })
 }
 
-fn stats_query(conn: &Connection, where_clause: &str, param: Option<&dyn ToSql>) -> Result<UsageStats> {
+fn stats_query(
+    conn: &Connection,
+    where_clause: &str,
+    param: Option<&dyn ToSql>,
+) -> Result<UsageStats> {
     let sql = format!("{STATS_SELECT} {where_clause}");
     match param {
         Some(v) => conn.query_row(&sql, params![v], row_to_usage),
@@ -530,9 +639,11 @@ pub const SETTING_TRIP_PAUSED_AT: &str = "trip_paused_at";
 pub const SETTING_TRIP_PAUSES: &str = "trip_pauses";
 
 pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
-    conn.query_row("SELECT value FROM settings WHERE key=?1", params![key], |row| {
-        row.get(0)
-    })
+    conn.query_row(
+        "SELECT value FROM settings WHERE key=?1",
+        params![key],
+        |row| row.get(0),
+    )
     .optional()
 }
 
@@ -659,12 +770,18 @@ fn bucket_query(
          FROM messages {where_clause} GROUP BY k ORDER BY {ordering}"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(bind, row_to_bucket)?.collect::<Result<Vec<_>>>()?;
+    let rows = stmt
+        .query_map(bind, row_to_bucket)?
+        .collect::<Result<Vec<_>>>()?;
     Ok(rows)
 }
 
 /// 按天统计：最近 days 天（含今天），created_at 为本地时间 "YYYY-MM-DD HH:MM:SS"
-pub fn stats_daily(conn: &Connection, aggregator_id: Option<i64>, days: i64) -> Result<Vec<StatsBucket>> {
+pub fn stats_daily(
+    conn: &Connection,
+    aggregator_id: Option<i64>,
+    days: i64,
+) -> Result<Vec<StatsBucket>> {
     let cutoff = (chrono::Local::now() - chrono::Duration::days(days - 1))
         .format("%Y-%m-%d")
         .to_string();
@@ -675,17 +792,15 @@ pub fn stats_daily(conn: &Connection, aggregator_id: Option<i64>, days: i64) -> 
         ),
         None => ("WHERE substr(created_at,1,10)>=?1", vec![&cutoff]),
     };
-    bucket_query(
-        conn,
-        "substr(created_at,1,10)",
-        where_clause,
-        "k",
-        &bind,
-    )
+    bucket_query(conn, "substr(created_at,1,10)", where_clause, "k", &bind)
 }
 
 /// 按小时统计：指定日期（"YYYY-MM-DD"）内 0-23 点各小时用量
-pub fn stats_hourly(conn: &Connection, aggregator_id: Option<i64>, date: &str) -> Result<Vec<StatsBucket>> {
+pub fn stats_hourly(
+    conn: &Connection,
+    aggregator_id: Option<i64>,
+    date: &str,
+) -> Result<Vec<StatsBucket>> {
     let (where_clause, bind): (&str, Vec<&dyn ToSql>) = match aggregator_id.as_ref() {
         Some(id) => (
             "WHERE aggregator_id=?1 AND substr(created_at,1,10)=?2",
@@ -871,10 +986,7 @@ pub fn list_messages(
     };
 
     let mut stmt = conn.prepare(&list_sql)?;
-    let rows = stmt.query_map(
-        params![aggregator_id, limit, offset],
-        row_to_summary,
-    )?;
+    let rows = stmt.query_map(params![aggregator_id, limit, offset], row_to_summary)?;
     let items = rows.collect::<Result<Vec<_>>>()?;
     Ok((total, items))
 }
@@ -901,14 +1013,39 @@ mod tests {
     #[test]
     fn plan_crud() {
         let conn = mem();
-        let p = create_plan(&conn, "p1", "https://a.example", "tok1", "r").unwrap();
+        let p = create_plan(
+            &conn,
+            "p1",
+            "https://a.example",
+            "tok1",
+            "r",
+            &["glm-4.7".into(), "claude-sonnet-5".into()],
+        )
+        .unwrap();
         assert!(p.enabled);
+        assert_eq!(
+            p.models,
+            vec!["glm-4.7".to_string(), "claude-sonnet-5".to_string()]
+        );
         let got = get_plan(&conn, p.id).unwrap().unwrap();
         assert_eq!(got.name, "p1");
-        update_plan(&conn, p.id, "p1x", "https://b.example", "tok2", "r2", false).unwrap();
+        assert_eq!(got.models, p.models);
+        // models 写入时 trim + 去空
+        update_plan(
+            &conn,
+            p.id,
+            "p1x",
+            "https://b.example",
+            "tok2",
+            "r2",
+            false,
+            &[" glm-4.7 ".into(), String::new(), ",,".into()],
+        )
+        .unwrap();
         let got = get_plan(&conn, p.id).unwrap().unwrap();
         assert_eq!(got.name, "p1x");
         assert!(!got.enabled);
+        assert_eq!(got.models, vec!["glm-4.7".to_string()]);
         assert_eq!(delete_plan(&conn, p.id).unwrap(), 1);
         assert!(get_plan(&conn, p.id).unwrap().is_none());
     }
@@ -916,14 +1053,17 @@ mod tests {
     #[test]
     fn bindings_and_reset() {
         let conn = mem();
-        let p1 = create_plan(&conn, "p1", "https://a", "t1", "").unwrap();
-        let p2 = create_plan(&conn, "p2", "https://b", "t2", "").unwrap();
-        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100).unwrap();
+        let p1 = create_plan(&conn, "p1", "https://a", "t1", "", &["glm-4.7".into()]).unwrap();
+        let p2 = create_plan(&conn, "p2", "https://b", "t2", "", &[]).unwrap();
+        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+            .unwrap();
         set_aggregator_plans(&conn, agg.id, &[p1.id, p2.id]).unwrap();
 
         let bs = list_bindings(&conn, agg.id).unwrap();
         assert_eq!(bs.len(), 2);
         assert_eq!(bs[0].plan.id, p1.id);
+        assert_eq!(bs[0].plan.models, vec!["glm-4.7".to_string()]);
+        assert!(bs[1].plan.models.is_empty());
         assert_eq!(bs[0].used_tokens, 0);
 
         add_binding_usage(&conn, bs[0].binding_id, 40).unwrap();
@@ -945,8 +1085,9 @@ mod tests {
     #[test]
     fn messages_paging_and_stats() {
         let conn = mem();
-        let p1 = create_plan(&conn, "p1", "https://a", "t1", "").unwrap();
-        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100).unwrap();
+        let p1 = create_plan(&conn, "p1", "https://a", "t1", "", &[]).unwrap();
+        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+            .unwrap();
         for i in 0..5 {
             insert_message(
                 &conn,
@@ -993,7 +1134,8 @@ mod tests {
     #[test]
     fn trip_meter() {
         let conn = mem();
-        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100).unwrap();
+        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+            .unwrap();
         // 插入一条 total_tokens=total 的消息；created 为 Some 时改写 created_at 便于构造时间线
         let insert_at = |total: i64, created: Option<&str>| {
             insert_message(
@@ -1061,7 +1203,8 @@ mod tests {
     #[test]
     fn trip_pause() {
         let conn = mem();
-        let agg = create_aggregator(&conn, "g1", 8301, "cpm-x", 100).unwrap();
+        let agg = create_aggregator(&conn, "g1", 8301, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+            .unwrap();
         let insert_at = |total: i64, created: &str| {
             insert_message(
                 &conn,
@@ -1142,37 +1285,53 @@ mod tests {
         let t = reset_trip(&conn).unwrap();
         assert!(!t.paused);
         assert_eq!(t.stats.total_tokens, 0);
-        assert!(get_setting(&conn, SETTING_TRIP_PAUSED_AT).unwrap().is_none());
+        assert!(get_setting(&conn, SETTING_TRIP_PAUSED_AT)
+            .unwrap()
+            .is_none());
         assert!(get_setting(&conn, SETTING_TRIP_PAUSES).unwrap().is_none());
     }
 
     #[test]
     fn delete_cascades_bindings() {
         let conn = mem();
-        let p1 = create_plan(&conn, "p1", "https://a", "t1", "").unwrap();
-        let p2 = create_plan(&conn, "p2", "https://b", "t2", "").unwrap();
-        let agg1 = create_aggregator(&conn, "g1", 8300, "cpm-1", 100).unwrap();
-        let agg2 = create_aggregator(&conn, "g2", 8301, "cpm-2", 100).unwrap();
+        let p1 = create_plan(&conn, "p1", "https://a", "t1", "", &[]).unwrap();
+        let p2 = create_plan(&conn, "p2", "https://b", "t2", "", &[]).unwrap();
+        let agg1 = create_aggregator(&conn, "g1", 8300, "cpm-1", 100, STRATEGY_THRESHOLD_ROTATION)
+            .unwrap();
+        let agg2 = create_aggregator(&conn, "g2", 8301, "cpm-2", 100, STRATEGY_THRESHOLD_ROTATION)
+            .unwrap();
 
         // 删除计划：其在所有聚合器下的绑定一并解除
         set_aggregator_plans(&conn, agg1.id, &[p1.id, p2.id]).unwrap();
         set_aggregator_plans(&conn, agg2.id, &[p1.id]).unwrap();
         assert_eq!(delete_plan(&conn, p1.id).unwrap(), 1);
-        assert_eq!(list_bindings(&conn, agg1.id).unwrap().len(), 1, "agg1 应只剩 p2");
-        assert!(list_bindings(&conn, agg2.id).unwrap().is_empty(), "agg2 绑定应全部解除");
+        assert_eq!(
+            list_bindings(&conn, agg1.id).unwrap().len(),
+            1,
+            "agg1 应只剩 p2"
+        );
+        assert!(
+            list_bindings(&conn, agg2.id).unwrap().is_empty(),
+            "agg2 绑定应全部解除"
+        );
 
         // 删除聚合器：其下绑定解除，其他聚合器不受影响
         set_aggregator_plans(&conn, agg1.id, &[p2.id]).unwrap();
         assert_eq!(delete_aggregator(&conn, agg2.id).unwrap(), 1);
         assert!(list_bindings(&conn, agg2.id).unwrap().is_empty());
-        assert_eq!(list_bindings(&conn, agg1.id).unwrap().len(), 1, "agg1 的绑定不应受影响");
+        assert_eq!(
+            list_bindings(&conn, agg1.id).unwrap().len(),
+            1,
+            "agg1 的绑定不应受影响"
+        );
     }
 
     #[test]
     fn grouped_stats_and_migration() {
         let conn = mem();
-        let p1 = create_plan(&conn, "p1", "https://a", "t1", "").unwrap();
-        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100).unwrap();
+        let p1 = create_plan(&conn, "p1", "https://a", "t1", "", &[]).unwrap();
+        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+            .unwrap();
         // NewMessage 不含 created_at（落库固定用 now_str），插入后用 SQL 改写时间
         let mk = |model: &str, created: &str, prompt: i64, completion: i64| {
             (
@@ -1242,7 +1401,9 @@ mod tests {
         assert_eq!(models[0].total_tokens, 150 + 300);
 
         // 聚合器过滤（其他聚合器 id 应为空）
-        assert!(stats_daily(&conn, Some(agg.id + 100), 1).unwrap().is_empty());
+        assert!(stats_daily(&conn, Some(agg.id + 100), 1)
+            .unwrap()
+            .is_empty());
 
         // 日期按字面量绑定：含 SQL 特殊字符的 date 不会被执行为语法
         let evil = format!("{today}' OR '1'='1");
@@ -1257,22 +1418,46 @@ mod tests {
                 status INTEGER NOT NULL DEFAULT 0, request_body TEXT NOT NULL DEFAULT '',
                 response_body TEXT NOT NULL DEFAULT '', prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
-                duration_ms INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);",
+                duration_ms INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+            CREATE TABLE coding_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, base_url TEXT NOT NULL,
+                auth_token TEXT NOT NULL, remark TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+            CREATE TABLE aggregators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, port INTEGER NOT NULL,
+                auth_token TEXT NOT NULL, strategy TEXT NOT NULL DEFAULT 'threshold_rotation',
+                token_threshold INTEGER NOT NULL DEFAULT 1000000, created_at TEXT NOT NULL);",
         )
         .unwrap();
         migrate(&old).unwrap();
         migrate(&old).unwrap(); // 幂等
-        let mut cols: Vec<String> = Vec::new();
-        {
-            let mut stmt = old.prepare("SELECT name FROM pragma_table_info('messages')").unwrap();
+        let table_cols = |table: &str| -> Vec<String> {
+            let mut cols: Vec<String> = Vec::new();
+            let mut stmt = old
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap();
             let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
             for r in rows {
                 cols.push(r.unwrap());
             }
-        }
+            cols
+        };
         for c in ["model", "cache_read_tokens", "cache_creation_tokens"] {
-            assert!(cols.iter().any(|x| x == c), "迁移后应有列 {c}");
+            assert!(
+                table_cols("messages").iter().any(|x| x == c),
+                "迁移后 messages 应有列 {c}"
+            );
         }
+        assert!(
+            table_cols("coding_plans").iter().any(|x| x == "models"),
+            "迁移后 coding_plans 应有 models 列"
+        );
+        assert!(
+            table_cols("aggregators")
+                .iter()
+                .any(|x| x == "current_plan_id"),
+            "迁移后 aggregators 应有 current_plan_id 列"
+        );
         old.execute(
             "INSERT INTO messages (aggregator_id, created_at) VALUES (1, '2026-08-17 10:00:00')",
             [],
@@ -1280,5 +1465,46 @@ mod tests {
         .unwrap();
         let buckets = stats_by_model(&old, None, None).unwrap();
         assert_eq!(buckets[0].key, ""); // 旧行 model 为空串
+    }
+
+    #[test]
+    fn strategy_and_current_plan() {
+        assert!(is_known_strategy(STRATEGY_THRESHOLD_ROTATION));
+        assert!(is_known_strategy(STRATEGY_MODEL_MATCH));
+        assert!(!is_known_strategy("model-match"));
+        assert!(!is_known_strategy(""));
+
+        let conn = mem();
+        let p1 = create_plan(&conn, "p1", "https://a", "t1", "", &[]).unwrap();
+        let p2 = create_plan(&conn, "p2", "https://b", "t2", "", &[]).unwrap();
+        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_MODEL_MATCH).unwrap();
+        assert_eq!(agg.strategy, STRATEGY_MODEL_MATCH);
+        assert!(agg.current_plan_id.is_none(), "新建聚合器未设置当前计划");
+
+        // 设置当前计划；db 层 update_aggregator 不触碰 current_plan_id
+        // （显式切换策略时是否清除由命令层决定）
+        assert!(set_current_plan(&conn, agg.id, p1.id).unwrap());
+        let got = get_aggregator(&conn, agg.id).unwrap().unwrap();
+        assert_eq!(got.current_plan_id, Some(p1.id));
+        update_aggregator(&conn, agg.id, "g1x", 8301, 200, STRATEGY_THRESHOLD_ROTATION).unwrap();
+        let got = get_aggregator(&conn, agg.id).unwrap().unwrap();
+        assert_eq!(got.name, "g1x");
+        assert_eq!(got.strategy, STRATEGY_THRESHOLD_ROTATION);
+        assert_eq!(
+            got.current_plan_id,
+            Some(p1.id),
+            "改策略/阈值不应清掉当前计划"
+        );
+
+        // 覆盖切换；清除；聚合器不存在返回 false
+        assert!(set_current_plan(&conn, agg.id, p2.id).unwrap());
+        let got = get_aggregator(&conn, agg.id).unwrap().unwrap();
+        assert_eq!(got.current_plan_id, Some(p2.id));
+        assert!(!set_current_plan(&conn, agg.id + 100, p1.id).unwrap());
+        assert!(!clear_current_plan(&conn, agg.id + 100).unwrap());
+        assert!(clear_current_plan(&conn, agg.id).unwrap());
+        let got = get_aggregator(&conn, agg.id).unwrap().unwrap();
+        assert_eq!(got.current_plan_id, None, "清除后恢复自动轮转");
+        let _ = p2;
     }
 }

@@ -18,17 +18,27 @@ import type {
 
 export const listPlans = () => invoke<PlanView[]>("list_plans");
 
+/** 提交前归一化模型列表：拆分单个 tag 中误输入的逗号，trim 并去空 */
+export function normalizeModels(models: string[]): string[] {
+  return models
+    .flatMap((m) => m.split(","))
+    .map((m) => m.trim())
+    .filter((m) => m.length > 0);
+}
+
 export const createPlan = (p: {
   name: string;
   baseUrl: string;
   authToken: string;
   remark?: string;
+  models?: string[];
 }) =>
   invoke<CodingPlan>("create_plan", {
     name: p.name,
     baseUrl: p.baseUrl,
     authToken: p.authToken,
     remark: p.remark,
+    models: p.models ? normalizeModels(p.models) : [],
   });
 
 export const updatePlan = (p: {
@@ -38,6 +48,7 @@ export const updatePlan = (p: {
   authToken: string;
   remark?: string;
   enabled?: boolean;
+  models?: string[];
 }) =>
   invoke<CodingPlan>("update_plan", {
     id: p.id,
@@ -46,6 +57,7 @@ export const updatePlan = (p: {
     authToken: p.authToken,
     remark: p.remark,
     enabled: p.enabled,
+    models: p.models ? normalizeModels(p.models) : undefined,
   });
 
 export const deletePlan = (id: number) => invoke<void>("delete_plan", { id });
@@ -60,11 +72,13 @@ export const createAggregator = (p: {
   name: string;
   port?: number | null;
   tokenThreshold?: number | null;
+  strategy?: string;
 }) =>
   invoke<AggregatorView>("create_aggregator", {
     name: p.name,
     port: p.port,
     tokenThreshold: p.tokenThreshold,
+    strategy: p.strategy,
   });
 
 export const updateAggregator = (p: {
@@ -72,13 +86,19 @@ export const updateAggregator = (p: {
   name: string;
   port: number;
   tokenThreshold: number;
+  strategy?: string;
 }) =>
   invoke<AggregatorView>("update_aggregator", {
     id: p.id,
     name: p.name,
     port: p.port,
     tokenThreshold: p.tokenThreshold,
+    strategy: p.strategy,
   });
+
+/** 手动设置模型匹配策略的「当前计划」（须为绑定且启用的计划） */
+export const setAggregatorCurrentPlan = (aggregatorId: number, planId: number | null) =>
+  invoke<AggregatorView>("set_current_plan", { aggregatorId, planId });
 
 export const deleteAggregator = (id: number) => invoke<void>("delete_aggregator", { id });
 

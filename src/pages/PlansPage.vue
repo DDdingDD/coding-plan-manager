@@ -28,6 +28,12 @@
             </a-button>
           </a-flex>
         </template>
+        <template v-else-if="column.key === 'models'">
+          <template v-if="record.models?.length">
+            <a-tag v-for="m in record.models" :key="m" style="margin: 2px">{{ m }}</a-tag>
+          </template>
+          <a-typography-text v-else type="secondary">-</a-typography-text>
+        </template>
         <template v-else-if="column.key === 'enabled'">
           <a-switch
             :checked="record.enabled"
@@ -65,6 +71,16 @@
         <a-form-item label="AUTH_TOKEN" required>
           <a-input-password v-model:value="form.auth_token" placeholder="该计划的上游令牌" />
         </a-form-item>
+        <a-form-item label="支持模型" extra="模型匹配策略据此路由；回车或逗号确认。留空表示不参与模型匹配（仍可作为当前计划承接流量）">
+          <a-select
+            v-model:value="form.models"
+            mode="tags"
+            placeholder="如 glm-4.7、claude-sonnet-5"
+            style="width: 100%"
+            :open="false"
+            :token-separators="[',', '，']"
+          />
+        </a-form-item>
         <a-form-item label="备注">
           <a-input v-model:value="form.remark" />
         </a-form-item>
@@ -86,13 +102,14 @@ import type { PlanView } from "../types";
 import { copyText, formatNumber } from "../utils";
 
 const columns = [
-  { title: "名称", dataIndex: "name", key: "name" },
+  { title: "名称", dataIndex: "name", key: "name", width: 140 },
   { title: "BASE_URL", dataIndex: "base_url", key: "base_url", ellipsis: true },
   { title: "AUTH_TOKEN", key: "auth_token" },
+  { title: "支持模型", key: "models", width: 200 },
   { title: "备注", dataIndex: "remark", key: "remark", ellipsis: true },
-  { title: "启用", key: "enabled", width: 80 },
-  { title: "累计消耗", key: "stats", width: 200 },
-  { title: "操作", key: "actions", width: 150 },
+  { title: "启用", key: "enabled", width: 70 },
+  { title: "累计消耗", key: "stats", width: 190 },
+  { title: "操作", key: "actions", width: 140 },
 ];
 
 const plans = ref<PlanView[]>([]);
@@ -102,7 +119,7 @@ const showToken = reactive<Record<number, boolean>>({});
 const modalOpen = ref(false);
 const submitting = ref(false);
 const editing = ref<PlanView | null>(null);
-const form = reactive({ name: "", base_url: "", auth_token: "", remark: "" });
+const form = reactive({ name: "", base_url: "", auth_token: "", remark: "", models: [] as string[] });
 
 const maskToken = (t: string) => (t.length > 8 ? `${t.slice(0, 5)}••••••${t.slice(-4)}` : "••••");
 
@@ -119,7 +136,7 @@ async function refresh() {
 
 function openCreate() {
   editing.value = null;
-  Object.assign(form, { name: "", base_url: "", auth_token: "", remark: "" });
+  Object.assign(form, { name: "", base_url: "", auth_token: "", remark: "", models: [] });
   modalOpen.value = true;
 }
 
@@ -130,6 +147,7 @@ function openEdit(p: PlanView) {
     base_url: p.base_url,
     auth_token: p.auth_token,
     remark: p.remark,
+    models: [...p.models],
   });
   modalOpen.value = true;
 }
@@ -145,6 +163,7 @@ async function submit() {
         authToken: form.auth_token,
         remark: form.remark,
         enabled: editing.value.enabled,
+        models: form.models,
       });
       message.success("已更新");
     } else {
@@ -153,6 +172,7 @@ async function submit() {
         baseUrl: form.base_url,
         authToken: form.auth_token,
         remark: form.remark,
+        models: form.models,
       });
       message.success("已创建");
     }
@@ -174,6 +194,7 @@ async function toggleEnabled(p: PlanView, enabled: boolean) {
       authToken: p.auth_token,
       remark: p.remark,
       enabled,
+      models: p.models,
     });
     await refresh();
   } catch (e) {

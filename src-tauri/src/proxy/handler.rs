@@ -37,8 +37,12 @@ const SKIP_REQ_HEADERS: &[&str] = &[
 ];
 
 /// 回传给客户端时跳过的响应头
-const SKIP_RESP_HEADERS: &[&str] =
-    &["content-length", "transfer-encoding", "connection", "keep-alive"];
+const SKIP_RESP_HEADERS: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+];
 
 /// 每个聚合器服务一份，随服务启动创建。
 /// app 为 None 时不向前端推送事件（集成测试场景）。
@@ -67,7 +71,9 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
     // ---- 1. 读取聚合器最新配置 + 鉴权 ----
     let agg_cfg = {
         let conn = lock_db(&shared);
-        db::get_aggregator(&conn, shared.aggregator_id).ok().flatten()
+        db::get_aggregator(&conn, shared.aggregator_id)
+            .ok()
+            .flatten()
     };
     let agg_cfg = match agg_cfg {
         Some(a) => a,
@@ -118,9 +124,19 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
     let req_body_stored = cap_store(&String::from_utf8_lossy(&body_bytes));
 
     // ---- 3. 转发策略：选择一个 coding plan ----
+    // 模型名从请求体提取（模型匹配策略的路由依据）。落库副本被 2MB 截断后
+    // JSON 无法整体解析，此时用完整 body 再试一次（仅大请求触发）
+    let req_model = {
+        let m = usage::extract_model(&req_body_stored, "");
+        if m.is_empty() && body_bytes.len() > MAX_STORED_BODY {
+            usage::extract_model(&String::from_utf8_lossy(&body_bytes), "")
+        } else {
+            m
+        }
+    };
     let pick = {
         let conn = lock_db(&shared);
-        strategy::pick_plan(&conn, &agg_cfg)
+        strategy::pick_plan(&conn, &agg_cfg, &req_model)
     };
     let pick = match pick {
         Ok(Some(p)) => p,
@@ -183,7 +199,11 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
     let method_up = match reqwest::Method::from_bytes(method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
-            return error_response(StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error", "不支持的 HTTP 方法")
+            return error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "invalid_request_error",
+                "不支持的 HTTP 方法",
+            )
         }
     };
 
@@ -308,7 +328,9 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
         });
 
         let body = Body::from_stream(ReceiverStream::new(rx));
-        resp_builder.body(body).unwrap_or_else(|_| Response::new(Body::empty()))
+        resp_builder
+            .body(body)
+            .unwrap_or_else(|_| Response::new(Body::empty()))
     } else {
         // 非流式：整体读取后回传
         let mut full: Vec<u8> = Vec::new();
@@ -367,7 +389,9 @@ async fn handle(shared: Arc<ProxyShared>, req: Request) -> Response {
             started,
         )
         .await;
-        resp_builder.body(Body::from(full)).unwrap_or_else(|_| Response::new(Body::empty()))
+        resp_builder
+            .body(Body::from(full))
+            .unwrap_or_else(|_| Response::new(Body::empty()))
     }
 }
 
@@ -384,7 +408,10 @@ fn lock_db(shared: &ProxyShared) -> MutexGuard<'_, Connection> {
 
 /// 从请求头中提取客户端出示的令牌（Bearer 或 x-api-key）
 fn presented_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(v) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         if v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer ") {
             return Some(v[7..].trim().to_string());
         }
@@ -518,10 +545,7 @@ mod tests {
         assert!(out.len() < s.len());
         assert!(out.ends_with("\n…[已截断]"), "应带截断标记");
         let body = out.strip_suffix("\n…[已截断]").unwrap();
-        assert!(
-            body.chars().all(|c| c == '汉'),
-            "截断不应撕裂多字节字符"
-        );
+        assert!(body.chars().all(|c| c == '汉'), "截断不应撕裂多字节字符");
     }
 
     #[test]
@@ -542,6 +566,9 @@ mod tests {
     #[test]
     fn decode_sse_stored_truncated_on_boundary() {
         // 截断点恰好是字符边界：原样保留再补标记
-        assert_eq!(decode_sse_stored("abc汉".as_bytes(), true), "abc汉\n…[已截断]");
+        assert_eq!(
+            decode_sse_stored("abc汉".as_bytes(), true),
+            "abc汉\n…[已截断]"
+        );
     }
 }

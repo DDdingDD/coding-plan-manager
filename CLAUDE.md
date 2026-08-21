@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目
 
-Coding Plan Manager：Tauri 2 桌面应用。管理多个 AI Coding Plan（GLM/Claude/OpenAI 兼容上游），并将其聚合成统一对外端点。每个"运行中"的聚合器在 Tauri 进程内启动一个独立的 Axum 反向代理服务；外部客户端（Claude Code 等）将 `ANTHROPIC_BASE_URL` 指向聚合器，代理按阈值轮转策略把请求转发给绑定的计划并替换鉴权令牌。
+Coding Plan Manager：Tauri 2 桌面应用。管理多个 AI Coding Plan（GLM/Claude/OpenAI 兼容上游），并将其聚合成统一对外端点。每个"运行中"的聚合器在 Tauri 进程内启动一个独立的 Axum 反向代理服务；外部客户端（Claude Code 等）将 `ANTHROPIC_BASE_URL` 指向聚合器，代理按路由策略（阈值轮转/模型匹配）把请求转发给绑定的计划并替换鉴权令牌。计划可配置「支持模型」列表（可空），模型匹配策略据此路由。
 
 ## 常用命令
 
@@ -15,7 +15,7 @@ npm run build                            # 前端 vue-tsc 类型检查 + Vite �
 npm run tauri build                      # 打包桌面应用
 
 # Rust 测试（在仓库根目录执行；需 MSVC 工具链）
-cargo test --manifest-path src-tauri/Cargo.toml              # 全部：31 单测 + 11 e2e
+cargo test --manifest-path src-tauri/Cargo.toml              # 全部：45 单测 + 12 e2e
 cargo test --manifest-path src-tauri/Cargo.toml --lib        # 仅单元测试
 cargo test --manifest-path src-tauri/Cargo.toml --test e2e   # 仅端到端测试
 cargo test --manifest-path src-tauri/Cargo.toml --test e2e e2e_tcp_server_start_stop  # 单个测试
@@ -30,11 +30,13 @@ node scripts/mock-upstream.mjs 9401      # 本地模拟上游（Anthropic/OpenAI
 前端 `src/`（Vue 3 + ant-design-vue，四个页面：计划/聚合器/消息/统计），后端 `src-tauri/src/`。核心在 Rust 侧：
 
 - **请求转发主链路** `proxy/handler.rs`（兜底路由，任意 method/path）：校验聚合器令牌（Bearer/x-api-key 均可）→ `strategy.rs` 选计划 → reqwest 转发（剥跳段头/原鉴权头，注入所选计划的 AUTH_TOKEN 为 Bearer + x-api-key 双头）→ 响应回传（SSE 走 mpsc channel 流式透传并累积副本；JSON 整体回传）→ `usage.rs` 解析用量（OpenAI/Anthropic 的 JSON 与 SSE 格式，Anthropic message_start 的 usage 嵌套在 `message.usage`；SSE 用量由 `SseUsageTracker` 在转发途中按行增量解析、不依赖 2MB 落库截断副本——否则流尾部的 message_delta/最终 chunk 丢失会少计 output_tokens；同时解析 prompt caching 的 `cache_read_input_tokens`/`cache_creation_input_tokens`，Anthropic 无显式 total 时按原始口径合计四项 input + cache_read + cache_creation + output，因此驱动轮转的绑定用量含缓存部分；OpenAI 的 `prompt_tokens_details.cached_tokens` 是 prompt 子集，刻意不解析以免重复计数）→ 落库 + 累加绑定用量 + emit `message:new` 事件推前端。
-- **阈值轮转** `proxy/strategy.rs`：按绑定顺序取第一个"启用且 used_tokens < token_threshold"的计划；**全部超额时清零所有绑定并回绕到第一个**（需求语义，勿改成 503）；仅"无任何启用计划"返回 503。同文件 `peek_plan` 以相同选择规则**无副作用**推导「当前转发的计划」（`AggregatorView.current_plan_id`，供前端高亮；不得改用 `pick_plan`--它会触发清零），改轮转规则时两处必须同步。
+- **路由策略** `proxy/strategy.rs`：`pick_plan(conn, agg, model)` 按 `aggregators.strategy` 分派，`peek_plan` 以相同规则**无副作用**推导「当前转发的计划」（`AggregatorView.current_plan_id`，供前端高亮；不得改用 `pick_plan`--阈值轮转会触发清零/清除失效指定、模型匹配会写 current_plan_id），改路由规则时两处必须同步：
+  - `threshold_rotation` 阈值轮转：手动指定的当前计划（current_plan_id 非空且「已绑定+启用+未达阈值」）优先固定转发；指定失效（达阈值/禁用/解绑）时 pick **自动清除指定**并恢复轮转。未指定时按绑定顺序取第一个"启用且 used_tokens < token_threshold"的计划；**全部超额时清零所有绑定并回绕到第一个**（需求语义，勿改成 503）；仅"无任何启用计划"返回 503（两种策略同此语义）。
+  - `model_match` 模型匹配：handler 从请求体提取模型名传入（落库副本被 2MB 截断时用完整 body 重试）。匹配集=「绑定且启用且 `coding_plans.models` 含该模型」的计划（models 逗号分隔存储，空=不参与匹配，仅可作当前计划承接流量）。当前计划在匹配集中则不变（粘性，即使别家用量更少）；否则切到匹配集中 used_tokens 最少者（同量取先绑定）并把新计划持久化为当前；无匹配（含未携带模型）走当前计划；当前失效（未绑定/禁用）回退第一个启用绑定并固化。**token 阈值不参与该策略路由**，used_tokens 仅用于展示与"最少用量"比较。当前计划存 `aggregators.current_plan_id`（`Aggregator` 结构体上标注 `#[serde(skip)]`--AggregatorView 以 flatten 内嵌 Aggregator 且自带派生的 current_plan_id 与 DB 原值 manual_current_plan_id--前端用它区分「自动轮转/已固定」，同时序列化会产生重复 JSON 键）。pick 不自查 DB 里的 current_plan_id，依赖 handler 每请求重读配置；命令层 `set_current_plan` 两种策略均可用（须为绑定且启用的计划；plan_id 传 null 清除指定），显式切换策略（update_aggregator 检测到 strategy 变化）会清除 current_plan_id。
 - **服务生命周期** `proxy/mod.rs::start_server`：bind TcpListener → spawn axum（CancellationToken 优雅关停）。运行中的服务句柄存 `state.rs AppState.servers`（仅内存，应用重启后不自动恢复）。
 - **Tauri 命令层** `commands/`（plans/aggregators/messages）：thin wrapper，每个命令自行 `lock()` 拿连接；统计查询命令（global/daily/hourly/model_stats 及小计里程 trip_stats/reset_trip/toggle_trip_pause）在 messages.rs。小计里程类似汽车短途里程：`settings` KV 表存起点时间（`trip_started_at`），按 `created_at>=起点` 聚合 messages，重置仅改起点、不动消息数据，故与累计统计天然互不影响；未重置时（起点为 NULL）小计=全部历史。暂停功能：`trip_paused_at` 存在即暂停（统计冻结在该时刻），继续时把 `[paused_at, now)` 追加到 `trip_pauses` JSON 区间列表，查询用半开区间排除——暂停期间的用量恢复后不补计；重置会一并清除两个暂停键。前端侧边栏圆盘组件 `src/components/TripGauge.vue`：单击=暂停/继续（250ms 延迟区分双击）、双击=重置（无确认框），暂停态琥珀色/计数中蓝色。`list_messages` 返回不含请求/响应体的 `MessageSummary`（两个 body 各上限 2MB，列表页不展示、不值得搬运；详情走 `get_message` 拉全量 `MessageRow`）。新建聚合器自动分配端口时跳过 DB 已占用端口（`resolve_create_port`，服务未运行时 bind 测不出冲突）。
 - **系统托盘** `tray.rs`：左键单击/菜单恢复主窗口；关闭窗口默认隐藏到托盘，侧边栏开关可改为退出确认（偏好存 localStorage，逻辑在 `App.vue`）。
-- **单连接模型**：整个应用共享一个 `Arc<Mutex<rusqlite::Connection>>`（commands 与代理服务共用）。handler **每次请求从 DB 重读聚合器配置**，因此阈值/令牌修改即时生效，无需重启服务；仅改端口要求先停止。
+- **单连接模型**：整个应用共享一个 `Arc<Mutex<rusqlite::Connection>>`（commands 与代理服务共用）。handler **每次请求从 DB 重读聚合器配置**，因此阈值/令牌/策略修改即时生效，无需重启服务；仅改端口要求先停止。模型匹配的粘性当前计划与阈值轮转的手动固定也依赖该重读保持新鲜（pick_plan 信任传入的 agg 结构体）。
 
 **统计的双轨设计（有意为之）**：`messages` 表 SUM 是历史统计（清零回绕不影响）；`aggregator_plans.used_tokens` 是轮转状态（回绕时清零）。测试断言时注意两者差异。
 

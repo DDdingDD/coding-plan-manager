@@ -34,6 +34,7 @@ pub fn create_plan(
     base_url: String,
     auth_token: String,
     remark: Option<String>,
+    models: Option<Vec<String>>,
 ) -> Result<CodingPlan, String> {
     let name = name.trim().to_string();
     let base_url = base_url.trim().to_string();
@@ -48,8 +49,15 @@ pub fn create_plan(
         return Err("AUTH_TOKEN 不能为空".into());
     }
     let conn = lock(&state);
-    db::create_plan(&conn, &name, &base_url, &auth_token, remark.as_deref().unwrap_or(""))
-        .map_err(e2s)
+    db::create_plan(
+        &conn,
+        &name,
+        &base_url,
+        &auth_token,
+        remark.as_deref().unwrap_or(""),
+        &models.unwrap_or_default(),
+    )
+    .map_err(e2s)
 }
 
 #[tauri::command]
@@ -61,6 +69,7 @@ pub fn update_plan(
     auth_token: String,
     remark: Option<String>,
     enabled: Option<bool>,
+    models: Option<Vec<String>>,
 ) -> Result<CodingPlan, String> {
     let name = name.trim().to_string();
     let base_url = base_url.trim().to_string();
@@ -79,9 +88,19 @@ pub fn update_plan(
     let enabled = enabled.unwrap_or(existing.enabled);
     // 缺省语义与 enabled 一致：省略即保持原值，而非清空
     let remark = remark.as_deref().unwrap_or(&existing.remark);
-    db::update_plan(&conn, id, &name, &base_url, &auth_token, remark, enabled)
-        .map_err(e2s)?
-        .ok_or_else(|| "计划不存在".into())
+    let models = models.unwrap_or(existing.models);
+    db::update_plan(
+        &conn,
+        id,
+        &name,
+        &base_url,
+        &auth_token,
+        remark,
+        enabled,
+        &models,
+    )
+    .map_err(e2s)?
+    .ok_or_else(|| "计划不存在".into())
 }
 
 #[tauri::command]

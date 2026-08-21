@@ -15,7 +15,8 @@ pub fn run() {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let db_path = dir.join("cpm.db");
-            let conn = db::init_db(db_path.to_string_lossy().as_ref()).map_err(|e| e.to_string())?;
+            let conn =
+                db::init_db(db_path.to_string_lossy().as_ref()).map_err(|e| e.to_string())?;
             app.manage(state::AppState {
                 db: Arc::new(Mutex::new(conn)),
                 servers: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -34,6 +35,7 @@ pub fn run() {
             commands::aggregators::delete_aggregator,
             commands::aggregators::set_aggregator_plans,
             commands::aggregators::reset_aggregator_usage,
+            commands::aggregators::set_current_plan,
             commands::aggregators::start_aggregator,
             commands::aggregators::stop_aggregator,
             commands::messages::list_messages,

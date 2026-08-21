@@ -44,7 +44,7 @@
           </a-flex>
         </template>
         <template v-else-if="column.key === 'plans'">
-          <a-tooltip v-for="b in record.bindings" :key="b.plan_id" :title="bindingTitle(record, b)">
+          <a-tooltip v-for="b in record.bindings" :key="b.plan_id" :title="bindingTitle(b, record)">
             <a-tag
               :color="b.plan_id === record.current_plan_id ? 'green' : 'default'"
               :style="{ margin: 2, opacity: b.enabled ? 1 : 0.45 }"
@@ -97,7 +97,17 @@
         <a-form-item label="端口" extra="留空自动分配（8300-8399）；服务运行中不可修改">
           <a-input-number v-model:value="form.port" :min="1" :max="65535" style="width: 100%" placeholder="自动分配" />
         </a-form-item>
-        <a-form-item label="单计划 token 阈值" extra="某个计划消耗达到阈值后自动切换到下一个；全部达到后清零回绕">
+        <a-form-item label="路由策略">
+          <a-radio-group v-model:value="form.strategy">
+            <a-radio-button value="threshold_rotation">阈值轮转</a-radio-button>
+            <a-radio-button value="model_match">模型匹配</a-radio-button>
+          </a-radio-group>
+        </a-form-item>
+        <a-form-item
+          v-if="form.strategy === 'threshold_rotation'"
+          label="单计划 token 阈值"
+          extra="按绑定顺序轮转；达到阈值切换下一个，全部超额清零回绕。详情中可手动固定当前计划"
+        >
           <a-input-number
             v-model:value="form.token_threshold"
             :min="1"
@@ -105,6 +115,10 @@
             style="width: 100%"
           />
         </a-form-item>
+        <a-typography-paragraph v-else type="secondary" style="margin-bottom: 0; font-size: 12px">
+          按请求携带的模型名匹配各计划配置的「支持模型」路由；当前计划不在匹配集中时切到用量最少的匹配计划，
+          无匹配则走当前计划。当前计划可在详情中手动切换。
+        </a-typography-paragraph>
       </a-form>
     </a-modal>
 
@@ -144,25 +158,67 @@
             </a-tag>
             <a-tag v-else color="error">无可用计划</a-tag>
             <a-typography-text type="secondary" style="font-size: 12px">
-              下一请求将转发到此计划
+              {{ detail.strategy === "model_match" ? "无匹配模型时走此计划，匹配命中即自动切换" : "下一请求将转发到此计划" }}
+            </a-typography-text>
+          </a-flex>
+          <a-flex align="center" :gap="8" style="margin-bottom: 8px">
+            <span>当前计划：</span>
+            <a-select
+              v-if="detail.strategy === 'model_match'"
+              :value="detail.current_plan_id"
+              style="width: 220px"
+              :options="currentPlanOptions"
+              :loading="settingCurrent"
+              @change="(v: any) => onSetCurrentPlan(v as number)"
+            />
+            <a-select
+              v-else
+              :value="detail.manual_current_plan_id ?? undefined"
+              style="width: 220px"
+              :options="currentPlanOptions"
+              :loading="settingCurrent"
+              allow-clear
+              placeholder="自动轮转"
+              @change="(v: any) => onSetCurrentPlan((v ?? null) as number | null)"
+            />
+            <a-typography-text type="secondary" style="font-size: 12px">
+              {{
+                detail.strategy === "model_match"
+                  ? "手动指定下一请求的兜底计划；模型匹配命中时会自动切换"
+                  : "固定当前转发的计划；该计划达阈值或失效后自动恢复轮转，清空则回到自动"
+              }}
             </a-typography-text>
           </a-flex>
           <a-flex align="center" :gap="8">
-            <a-tag color="blue">阈值轮转 threshold_rotation</a-tag>
-            <span>单计划阈值</span>
-            <a-input-number
-              v-model:value="thresholdDraft"
-              :min="1"
-              :step="100000"
+            <a-radio-group
+              :value="detail.strategy"
               size="small"
-              style="width: 140px"
-            />
-            <a-button size="small" @click="saveThreshold" :loading="savingThreshold">保存</a-button>
+              button-style="solid"
+              :disabled="switchingStrategy"
+              @change="(e: any) => onStrategyChange(e.target.value as string)"
+            >
+              <a-radio-button value="threshold_rotation">阈值轮转</a-radio-button>
+              <a-radio-button value="model_match">模型匹配</a-radio-button>
+            </a-radio-group>
+            <template v-if="detail.strategy === 'threshold_rotation'">
+              <span>单计划阈值</span>
+              <a-input-number
+                v-model:value="thresholdDraft"
+                :min="1"
+                :step="100000"
+                size="small"
+                style="width: 140px"
+              />
+              <a-button size="small" @click="saveThreshold" :loading="savingThreshold">保存</a-button>
+            </template>
             <a-button size="small" @click="resetUsage" :loading="resetting">重置用量</a-button>
           </a-flex>
         </a-card>
 
-        <a-card size="small" title="绑定的 Coding Plan（自上而下轮转）">
+        <a-card
+          size="small"
+          :title="detail.strategy === 'model_match' ? '绑定的 Coding Plan（按模型匹配路由）' : '绑定的 Coding Plan（自上而下轮转）'"
+        >
           <a-table
             :columns="bindingColumns"
             :data-source="detail.bindings"
@@ -181,13 +237,29 @@
                   当前
                 </a-tag>
               </template>
+              <template v-else-if="column.key === 'models'">
+                <template v-if="record.models?.length">
+                  <a-tag v-for="m in record.models" :key="m" style="margin: 2px">{{ m }}</a-tag>
+                </template>
+                <a-typography-text v-else type="secondary">-</a-typography-text>
+              </template>
               <template v-else-if="column.key === 'usage'">
-                <a-progress
-                  :percent="Math.min(100, Math.round((record.used_tokens / Math.max(1, record.token_threshold)) * 100))"
-                  :status="record.used_tokens >= record.token_threshold ? 'exception' : 'active'"
-                  size="small"
-                  :format="() => `${formatNumber(record.used_tokens)} / ${formatNumber(record.token_threshold)}`"
-                />
+                <!-- 进度条与数字上下堆叠并定宽列，避免长数字横向溢出遮挡操作列 -->
+                <a-flex vertical :gap="2" style="min-width: 0">
+                  <a-progress
+                    :percent="Math.min(100, Math.round((record.used_tokens / Math.max(1, record.token_threshold)) * 100))"
+                    :status="record.used_tokens >= record.token_threshold ? 'exception' : 'active'"
+                    size="small"
+                    :show-info="false"
+                    style="margin: 0"
+                  />
+                  <a-typography-text
+                    type="secondary"
+                    style="display: block; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"
+                  >
+                    {{ formatNumber(record.used_tokens) }} / {{ formatNumber(record.token_threshold) }}
+                  </a-typography-text>
+                </a-flex>
               </template>
               <template v-else-if="column.key === 'actions'">
                 <a-flex :gap="2">
@@ -247,14 +319,22 @@ import {
   listAggregators,
   listPlans,
   resetAggregatorUsage,
+  setAggregatorCurrentPlan,
   setAggregatorPlans,
   startAggregator,
   stopAggregator,
   updateAggregator,
   onNewMessage,
 } from "../api";
-import type { AggregatorView } from "../types";
+import type { AggregatorView, BindingView } from "../types";
 import { copyText, debounce, formatNumber } from "../utils";
+
+/** 路由策略标识（与 Rust 侧 db.rs 常量一致） */
+const STRATEGY_THRESHOLD_ROTATION = "threshold_rotation";
+const STRATEGY_MODEL_MATCH = "model_match";
+
+const strategyLabel = (s: string) =>
+  s === STRATEGY_MODEL_MATCH ? "模型匹配" : "阈值轮转";
 
 const columns = [
   { title: "名称", dataIndex: "name", key: "name", width: 140 },
@@ -266,12 +346,21 @@ const columns = [
   { title: "操作", key: "actions", width: 260 },
 ];
 
-const bindingColumns = [
-  { title: "顺序", dataIndex: "position", key: "position", width: 60 },
-  { title: "计划", dataIndex: "plan_name", key: "plan_name" },
-  { title: "已用 / 阈值", key: "usage" },
-  { title: "操作", key: "actions", width: 130 },
-];
+/** 绑定表格列：仅模型匹配策略显示「支持模型」（阈值轮转不依赖该列） */
+const bindingColumns = computed(() => {
+  const cols: { title: string; dataIndex?: string; key: string; width?: number }[] = [
+    { title: "顺序", dataIndex: "position", key: "position", width: 60 },
+    { title: "计划", dataIndex: "plan_name", key: "plan_name" },
+  ];
+  if (detail.value?.strategy === STRATEGY_MODEL_MATCH) {
+    cols.push({ title: "支持模型", key: "models", width: 160 });
+  }
+  cols.push(
+    { title: "已用 / 阈值", key: "usage", width: 170 },
+    { title: "操作", key: "actions", width: 120 },
+  );
+  return cols;
+});
 
 const aggs = ref<AggregatorView[]>([]);
 const loading = ref(false);
@@ -280,14 +369,19 @@ const toggling = reactive<Record<number, boolean>>({});
 
 const maskToken = (t: string) => (t.length > 8 ? `${t.slice(0, 5)}••••••${t.slice(-4)}` : "••••");
 
-/** 绑定 tag 的悬停提示：当前转发 / 已禁用 / 已达阈值 / 用量 */
-function bindingTitle(
-  b: { plan_id: number; enabled: boolean; used_tokens: number; token_threshold: number },
-  currentPlanId: number | null,
-): string {
+/** 绑定 tag 的悬停提示：当前转发（阈值轮转区分手动固定/自动轮转）/ 已禁用 / 模型匹配的支持模型 / 已达阈值 / 用量 */
+function bindingTitle(b: BindingView, agg: AggregatorView): string {
   const usage = `已用 ${formatNumber(b.used_tokens)} / 阈值 ${formatNumber(b.token_threshold)}`;
-  if (b.plan_id === currentPlanId) return `当前转发到此计划（${usage}）`;
+  if (b.plan_id === agg.current_plan_id) {
+    const pinned =
+      agg.strategy === STRATEGY_THRESHOLD_ROTATION && b.plan_id === agg.manual_current_plan_id;
+    return `${pinned ? "手动固定当前转发" : "当前转发到此计划"}（${usage}）`;
+  }
   if (!b.enabled) return "已禁用，不参与轮转";
+  if (agg.strategy === STRATEGY_MODEL_MATCH) {
+    const models = b.models?.length ? `，支持 ${b.models.join("、")}` : "";
+    return `${usage}${models}`;
+  }
   if (b.used_tokens >= b.token_threshold) return `已达阈值，等待回绕（${usage}）`;
   return usage;
 }
@@ -311,15 +405,26 @@ async function refresh() {
 const modalOpen = ref(false);
 const submitting = ref(false);
 const editing = ref<AggregatorView | null>(null);
-const form = reactive<{ name: string; port: number | null; token_threshold: number }>({
+const form = reactive<{
+  name: string;
+  port: number | null;
+  token_threshold: number;
+  strategy: string;
+}>({
   name: "",
   port: null,
   token_threshold: 1000000,
+  strategy: STRATEGY_THRESHOLD_ROTATION,
 });
 
 function openCreate() {
   editing.value = null;
-  Object.assign(form, { name: "", port: null, token_threshold: 1000000 });
+  Object.assign(form, {
+    name: "",
+    port: null,
+    token_threshold: 1000000,
+    strategy: STRATEGY_THRESHOLD_ROTATION,
+  });
   modalOpen.value = true;
 }
 
@@ -329,6 +434,7 @@ function openEdit(agg: AggregatorView) {
     name: agg.name,
     port: agg.port,
     token_threshold: agg.token_threshold,
+    strategy: agg.strategy,
   });
   modalOpen.value = true;
 }
@@ -342,6 +448,7 @@ async function submit() {
         name: form.name,
         port: form.port ?? editing.value.port,
         tokenThreshold: form.token_threshold,
+        strategy: form.strategy,
       });
       message.success("已更新");
     } else {
@@ -349,6 +456,7 @@ async function submit() {
         name: form.name,
         port: form.port,
         tokenThreshold: form.token_threshold,
+        strategy: form.strategy,
       });
       message.success("已创建，令牌已自动生成");
     }
@@ -403,6 +511,7 @@ const currentPlanName = computed(() => {
 });
 const thresholdDraft = ref<number>(0);
 const savingThreshold = ref(false);
+const switchingStrategy = ref(false);
 const resetting = ref(false);
 const planToAdd = ref<number | null>(null);
 const allPlans = ref<{ id: number; name: string; enabled: boolean }[]>([]);
@@ -431,6 +540,7 @@ async function saveThreshold() {
       name: detail.value.name,
       port: detail.value.port,
       tokenThreshold: thresholdDraft.value,
+      strategy: detail.value.strategy,
     });
     message.success("阈值已保存");
     await refresh();
@@ -438,6 +548,58 @@ async function saveThreshold() {
     message.error(String(e));
   } finally {
     savingThreshold.value = false;
+  }
+}
+
+/** 抽屉内直接切换路由策略（配置逐请求重读，运行中即时生效，仅改端口需先停止） */
+async function onStrategyChange(strategy: string) {
+  if (!detail.value || strategy === detail.value.strategy) return;
+  switchingStrategy.value = true;
+  try {
+    detail.value = await updateAggregator({
+      id: detail.value.id,
+      name: detail.value.name,
+      port: detail.value.port,
+      tokenThreshold: detail.value.token_threshold,
+      strategy,
+    });
+    message.success(`路由策略已切换为${strategyLabel(strategy)}`);
+    await refresh();
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    switchingStrategy.value = false;
+  }
+}
+
+// ---- 手动切换当前计划（两种策略均可用） ----
+const settingCurrent = ref(false);
+
+/** 当前计划下拉选项：仅已绑定且启用的计划可设为当前；
+ *  阈值轮转禁用已达阈值的选项（选了也会被轮转跳过） */
+const currentPlanOptions = computed(() => {
+  if (!detail.value) return [];
+  const match = detail.value.strategy === STRATEGY_MODEL_MATCH;
+  return detail.value.bindings
+    .filter((b) => b.enabled)
+    .map((b) => ({
+      value: b.plan_id,
+      disabled: !match && b.used_tokens >= b.token_threshold,
+      label: match ? b.plan_name + (b.models.length ? `（${b.models.join("、")}）` : "") : b.plan_name,
+    }));
+});
+
+async function onSetCurrentPlan(planId: number | null) {
+  if (!detail.value) return;
+  settingCurrent.value = true;
+  try {
+    detail.value = await setAggregatorCurrentPlan(detail.value.id, planId);
+    message.success(planId == null ? "已恢复自动轮转" : "当前计划已切换");
+    await refresh();
+  } catch (e) {
+    message.error(String(e));
+  } finally {
+    settingCurrent.value = false;
   }
 }
 
