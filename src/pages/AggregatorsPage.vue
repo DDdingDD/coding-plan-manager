@@ -12,6 +12,8 @@
       row-key="id"
       :pagination="false"
       size="middle"
+      :custom-row="customRow"
+      :row-class-name="rowClassName"
     >
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'status'">
@@ -82,6 +84,14 @@
       </template>
     </a-table>
 
+    <!-- 内联详情：聚合器不超过 INLINE_DETAIL_MAX 个时直接展示在表格下方，点击行或「详情」切换 -->
+    <template v-if="inlineDetail">
+      <a-divider orientation="left" style="margin: 20px 0 16px">
+        详情：{{ inlineDetail.name }}
+      </a-divider>
+      <AggregatorDetail :agg="inlineDetail" @changed="onDetailChanged" />
+    </template>
+
     <!-- 新建/编辑 -->
     <a-modal
       v-model:open="modalOpen"
@@ -122,181 +132,9 @@
       </a-form>
     </a-modal>
 
-    <!-- 详情抽屉 -->
+    <!-- 详情抽屉：聚合器数量超过 INLINE_DETAIL_MAX 个时使用（内联详情的备选形态） -->
     <a-drawer v-model:open="detailOpen" width="640" :title="detail?.name ?? ''">
-      <template v-if="detail">
-        <a-card size="small" title="接入参数" style="margin-bottom: 16px">
-          <a-descriptions :column="1" size="small">
-            <a-descriptions-item label="BASE_URL">
-              <a-flex :gap="6" align="center">
-                <a-typography-text code>{{ detail.base_url }}</a-typography-text>
-                <a-button size="small" type="text" @click="copyText(detail.base_url, '已复制')">
-                  <CopyOutlined />
-                </a-button>
-              </a-flex>
-            </a-descriptions-item>
-            <a-descriptions-item label="AUTH_TOKEN">
-              <a-flex :gap="6" align="center">
-                <a-typography-text code>{{ detail.auth_token }}</a-typography-text>
-                <a-button size="small" type="text" @click="copyText(detail.auth_token, '已复制')">
-                  <CopyOutlined />
-                </a-button>
-              </a-flex>
-            </a-descriptions-item>
-          </a-descriptions>
-          <a-typography-paragraph type="secondary" style="margin-bottom: 0; font-size: 12px">
-            Claude Code 接入：设置环境变量 ANTHROPIC_BASE_URL={{ detail.base_url }}、
-            ANTHROPIC_AUTH_TOKEN=&lt;上方令牌&gt;。状态需为「运行中」。
-          </a-typography-paragraph>
-        </a-card>
-
-        <a-card size="small" title="转发策略" style="margin-bottom: 16px">
-          <a-flex align="center" :gap="8" style="margin-bottom: 8px">
-            <span>当前转发：</span>
-            <a-tag v-if="currentPlanName" color="green">
-              <AimOutlined style="margin-right: 4px" />{{ currentPlanName }}
-            </a-tag>
-            <a-tag v-else color="error">无可用计划</a-tag>
-            <a-typography-text type="secondary" style="font-size: 12px">
-              {{ detail.strategy === "model_match" ? "无匹配模型时走此计划，匹配命中即自动切换" : "下一请求将转发到此计划" }}
-            </a-typography-text>
-          </a-flex>
-          <a-flex align="center" :gap="8" style="margin-bottom: 8px">
-            <span>当前计划：</span>
-            <a-select
-              v-if="detail.strategy === 'model_match'"
-              :value="detail.current_plan_id"
-              style="width: 220px"
-              :options="currentPlanOptions"
-              :loading="settingCurrent"
-              @change="(v: any) => onSetCurrentPlan(v as number)"
-            />
-            <a-select
-              v-else
-              :value="detail.manual_current_plan_id ?? undefined"
-              style="width: 220px"
-              :options="currentPlanOptions"
-              :loading="settingCurrent"
-              allow-clear
-              placeholder="自动轮转"
-              @change="(v: any) => onSetCurrentPlan((v ?? null) as number | null)"
-            />
-            <a-typography-text type="secondary" style="font-size: 12px">
-              {{
-                detail.strategy === "model_match"
-                  ? "手动指定下一请求的兜底计划；模型匹配命中时会自动切换"
-                  : "固定当前转发的计划；该计划达阈值或失效后自动恢复轮转，清空则回到自动"
-              }}
-            </a-typography-text>
-          </a-flex>
-          <a-flex align="center" :gap="8">
-            <a-radio-group
-              :value="detail.strategy"
-              size="small"
-              button-style="solid"
-              :disabled="switchingStrategy"
-              @change="(e: any) => onStrategyChange(e.target.value as string)"
-            >
-              <a-radio-button value="threshold_rotation">阈值轮转</a-radio-button>
-              <a-radio-button value="model_match">模型匹配</a-radio-button>
-            </a-radio-group>
-            <template v-if="detail.strategy === 'threshold_rotation'">
-              <span>单计划阈值</span>
-              <a-input-number
-                v-model:value="thresholdDraft"
-                :min="1"
-                :step="100000"
-                size="small"
-                style="width: 140px"
-              />
-              <a-button size="small" @click="saveThreshold" :loading="savingThreshold">保存</a-button>
-            </template>
-            <a-button size="small" @click="resetUsage" :loading="resetting">重置用量</a-button>
-          </a-flex>
-        </a-card>
-
-        <a-card
-          size="small"
-          :title="detail.strategy === 'model_match' ? '绑定的 Coding Plan（按模型匹配路由）' : '绑定的 Coding Plan（自上而下轮转）'"
-        >
-          <a-table
-            :columns="bindingColumns"
-            :data-source="detail.bindings"
-            :pagination="false"
-            size="small"
-            row-key="plan_id"
-          >
-            <template #bodyCell="{ column, record, index }">
-              <template v-if="column.key === 'plan_name'">
-                {{ record.plan_name }}
-                <a-tag
-                  v-if="record.plan_id === detail?.current_plan_id"
-                  color="green"
-                  style="margin-left: 4px"
-                >
-                  当前
-                </a-tag>
-              </template>
-              <template v-else-if="column.key === 'models'">
-                <template v-if="record.models?.length">
-                  <a-tag v-for="m in record.models" :key="m" style="margin: 2px">{{ m }}</a-tag>
-                </template>
-                <a-typography-text v-else type="secondary">-</a-typography-text>
-              </template>
-              <template v-else-if="column.key === 'usage'">
-                <!-- 进度条与数字上下堆叠并定宽列，避免长数字横向溢出遮挡操作列 -->
-                <a-flex vertical :gap="2" style="min-width: 0">
-                  <a-progress
-                    :percent="Math.min(100, Math.round((record.used_tokens / Math.max(1, record.token_threshold)) * 100))"
-                    :status="record.used_tokens >= record.token_threshold ? 'exception' : 'active'"
-                    size="small"
-                    :show-info="false"
-                    style="margin: 0"
-                  />
-                  <a-typography-text
-                    type="secondary"
-                    style="display: block; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis"
-                  >
-                    {{ formatNumber(record.used_tokens) }} / {{ formatNumber(record.token_threshold) }}
-                  </a-typography-text>
-                </a-flex>
-              </template>
-              <template v-else-if="column.key === 'actions'">
-                <a-flex :gap="2">
-                  <a-button size="small" type="text" :disabled="index === 0" @click="moveBinding(index as number, -1)">
-                    <UpOutlined />
-                  </a-button>
-                  <a-button
-                    size="small"
-                    type="text"
-                    :disabled="index === (detail?.bindings.length ?? 0) - 1"
-                    @click="moveBinding(index as number, 1)"
-                  >
-                    <DownOutlined />
-                  </a-button>
-                  <a-popconfirm title="解除绑定？" @confirm="removeBinding(index as number)">
-                    <a-button size="small" type="text" danger>
-                      <DeleteOutlined />
-                    </a-button>
-                  </a-popconfirm>
-                </a-flex>
-              </template>
-            </template>
-          </a-table>
-
-          <a-flex :gap="8" style="margin-top: 12px">
-            <a-select
-              v-model:value="planToAdd"
-              placeholder="选择要绑定的 Coding Plan"
-              style="flex: 1"
-              :options="bindableOptions"
-              show-search
-              option-filter-prop="label"
-            />
-            <a-button @click="addBinding" :disabled="!planToAdd">绑定</a-button>
-          </a-flex>
-        </a-card>
-      </template>
+      <AggregatorDetail v-if="detail" :agg="detail" @changed="onDetailChanged" />
     </a-drawer>
   </div>
 </template>
@@ -307,20 +145,13 @@ import { message } from "ant-design-vue";
 import {
   AimOutlined,
   CopyOutlined,
-  DeleteOutlined,
-  DownOutlined,
   EyeInvisibleOutlined,
   EyeOutlined,
-  UpOutlined,
 } from "@ant-design/icons-vue";
 import {
   createAggregator,
   deleteAggregator,
   listAggregators,
-  listPlans,
-  resetAggregatorUsage,
-  setAggregatorCurrentPlan,
-  setAggregatorPlans,
   startAggregator,
   stopAggregator,
   updateAggregator,
@@ -328,13 +159,14 @@ import {
 } from "../api";
 import type { AggregatorView, BindingView } from "../types";
 import { copyText, debounce, formatNumber } from "../utils";
+import AggregatorDetail from "../components/AggregatorDetail.vue";
 
 /** 路由策略标识（与 Rust 侧 db.rs 常量一致） */
 const STRATEGY_THRESHOLD_ROTATION = "threshold_rotation";
 const STRATEGY_MODEL_MATCH = "model_match";
 
-const strategyLabel = (s: string) =>
-  s === STRATEGY_MODEL_MATCH ? "模型匹配" : "阈值轮转";
+/** 聚合器数量不超过此值时，详情直接内联显示在表格下方（否则走抽屉） */
+const INLINE_DETAIL_MAX = 3;
 
 const columns = [
   { title: "名称", dataIndex: "name", key: "name", width: 140 },
@@ -345,22 +177,6 @@ const columns = [
   { title: "累计消耗", key: "stats", width: 180 },
   { title: "操作", key: "actions", width: 260 },
 ];
-
-/** 绑定表格列：仅模型匹配策略显示「支持模型」（阈值轮转不依赖该列） */
-const bindingColumns = computed(() => {
-  const cols: { title: string; dataIndex?: string; key: string; width?: number }[] = [
-    { title: "顺序", dataIndex: "position", key: "position", width: 60 },
-    { title: "计划", dataIndex: "plan_name", key: "plan_name" },
-  ];
-  if (detail.value?.strategy === STRATEGY_MODEL_MATCH) {
-    cols.push({ title: "支持模型", key: "models", width: 160 });
-  }
-  cols.push(
-    { title: "已用 / 阈值", key: "usage", width: 170 },
-    { title: "操作", key: "actions", width: 120 },
-  );
-  return cols;
-});
 
 const aggs = ref<AggregatorView[]>([]);
 const loading = ref(false);
@@ -384,6 +200,37 @@ function bindingTitle(b: BindingView, agg: AggregatorView): string {
   }
   if (b.used_tokens >= b.token_threshold) return `已达阈值，等待回绕（${usage}）`;
   return usage;
+}
+
+// ---- 内联详情选择 ----
+/** 内联模式下选中的聚合器 id；未选中或已删除时回落到第一个 */
+const selectedId = ref<number | null>(null);
+const inlineMode = computed(() => aggs.value.length > 0 && aggs.value.length <= INLINE_DETAIL_MAX);
+const inlineDetail = computed(() => {
+  if (!inlineMode.value) return null;
+  return aggs.value.find((a) => a.id === selectedId.value) ?? aggs.value[0];
+});
+
+/** 内联模式下点击行即切换详情对象 */
+function customRow(record: AggregatorView) {
+  return {
+    onClick: () => {
+      if (inlineMode.value) selectedId.value = record.id;
+    },
+    style: inlineMode.value ? "cursor: pointer" : "",
+  };
+}
+
+function rowClassName(record: AggregatorView) {
+  return record.id === inlineDetail.value?.id ? "agg-row-active" : "";
+}
+
+/** 详情组件内修改成功：就地更新列表与抽屉数据，再后台刷新保持一致 */
+async function onDetailChanged(updated: AggregatorView) {
+  const idx = aggs.value.findIndex((a) => a.id === updated.id);
+  if (idx >= 0) aggs.value[idx] = updated;
+  if (detail.value?.id === updated.id) detail.value = updated;
+  await refresh();
 }
 
 async function refresh() {
@@ -474,6 +321,7 @@ async function removeAgg(id: number) {
     await deleteAggregator(id);
     message.success("已删除");
     if (detail.value?.id === id) detailOpen.value = false;
+    if (selectedId.value === id) selectedId.value = null;
     await refresh();
   } catch (e) {
     message.error(String(e));
@@ -499,156 +347,18 @@ async function toggleRun(agg: AggregatorView) {
   }
 }
 
-// ---- 详情抽屉 ----
+// ---- 详情（抽屉 / 内联共用同一组件） ----
 const detailOpen = ref(false);
 const detail = ref<AggregatorView | null>(null);
-/** 当前转发计划（current_plan_id 对应绑定）的名称，无可用计划时为 null */
-const currentPlanName = computed(() => {
-  if (!detail.value) return null;
-  return (
-    detail.value.bindings.find((b) => b.plan_id === detail.value!.current_plan_id)?.plan_name ?? null
-  );
-});
-const thresholdDraft = ref<number>(0);
-const savingThreshold = ref(false);
-const switchingStrategy = ref(false);
-const resetting = ref(false);
-const planToAdd = ref<number | null>(null);
-const allPlans = ref<{ id: number; name: string; enabled: boolean }[]>([]);
 
-const bindableOptions = computed(() => {
-  if (!detail.value) return [];
-  const bound = new Set(detail.value.bindings.map((b) => b.plan_id));
-  return allPlans.value
-    .filter((p) => !bound.has(p.id))
-    .map((p) => ({ value: p.id, label: p.name + (p.enabled ? "" : "（已禁用）") }));
-});
-
+/** 内联模式直接切换选中项；否则打开抽屉 */
 function openDetail(agg: AggregatorView) {
+  if (inlineMode.value) {
+    selectedId.value = agg.id;
+    return;
+  }
   detail.value = agg;
-  thresholdDraft.value = agg.token_threshold;
   detailOpen.value = true;
-  listPlans().then((ps) => (allPlans.value = ps.map((p) => ({ id: p.id, name: p.name, enabled: p.enabled }))));
-}
-
-async function saveThreshold() {
-  if (!detail.value) return;
-  savingThreshold.value = true;
-  try {
-    detail.value = await updateAggregator({
-      id: detail.value.id,
-      name: detail.value.name,
-      port: detail.value.port,
-      tokenThreshold: thresholdDraft.value,
-      strategy: detail.value.strategy,
-    });
-    message.success("阈值已保存");
-    await refresh();
-  } catch (e) {
-    message.error(String(e));
-  } finally {
-    savingThreshold.value = false;
-  }
-}
-
-/** 抽屉内直接切换路由策略（配置逐请求重读，运行中即时生效，仅改端口需先停止） */
-async function onStrategyChange(strategy: string) {
-  if (!detail.value || strategy === detail.value.strategy) return;
-  switchingStrategy.value = true;
-  try {
-    detail.value = await updateAggregator({
-      id: detail.value.id,
-      name: detail.value.name,
-      port: detail.value.port,
-      tokenThreshold: detail.value.token_threshold,
-      strategy,
-    });
-    message.success(`路由策略已切换为${strategyLabel(strategy)}`);
-    await refresh();
-  } catch (e) {
-    message.error(String(e));
-  } finally {
-    switchingStrategy.value = false;
-  }
-}
-
-// ---- 手动切换当前计划（两种策略均可用） ----
-const settingCurrent = ref(false);
-
-/** 当前计划下拉选项：仅已绑定且启用的计划可设为当前；
- *  阈值轮转禁用已达阈值的选项（选了也会被轮转跳过） */
-const currentPlanOptions = computed(() => {
-  if (!detail.value) return [];
-  const match = detail.value.strategy === STRATEGY_MODEL_MATCH;
-  return detail.value.bindings
-    .filter((b) => b.enabled)
-    .map((b) => ({
-      value: b.plan_id,
-      disabled: !match && b.used_tokens >= b.token_threshold,
-      label: match ? b.plan_name + (b.models.length ? `（${b.models.join("、")}）` : "") : b.plan_name,
-    }));
-});
-
-async function onSetCurrentPlan(planId: number | null) {
-  if (!detail.value) return;
-  settingCurrent.value = true;
-  try {
-    detail.value = await setAggregatorCurrentPlan(detail.value.id, planId);
-    message.success(planId == null ? "已恢复自动轮转" : "当前计划已切换");
-    await refresh();
-  } catch (e) {
-    message.error(String(e));
-  } finally {
-    settingCurrent.value = false;
-  }
-}
-
-async function resetUsage() {
-  if (!detail.value) return;
-  resetting.value = true;
-  try {
-    detail.value = await resetAggregatorUsage(detail.value.id);
-    message.success("用量已清零");
-    await refresh();
-  } catch (e) {
-    message.error(String(e));
-  } finally {
-    resetting.value = false;
-  }
-}
-
-async function saveBindings(planIds: number[]) {
-  if (!detail.value) return;
-  try {
-    detail.value = await setAggregatorPlans(detail.value.id, planIds);
-    await refresh();
-  } catch (e) {
-    message.error(String(e));
-  }
-}
-
-function moveBinding(index: number, dir: -1 | 1) {
-  if (!detail.value) return;
-  const ids = detail.value.bindings.map((b) => b.plan_id);
-  const j = index + dir;
-  if (j < 0 || j >= ids.length) return;
-  [ids[index], ids[j]] = [ids[j], ids[index]];
-  saveBindings(ids);
-}
-
-function removeBinding(index: number) {
-  if (!detail.value) return;
-  const ids = detail.value.bindings.map((b) => b.plan_id);
-  ids.splice(index, 1);
-  saveBindings(ids);
-}
-
-function addBinding() {
-  if (!detail.value || !planToAdd.value) return;
-  const ids = detail.value.bindings.map((b) => b.plan_id);
-  ids.push(planToAdd.value);
-  planToAdd.value = null;
-  saveBindings(ids);
 }
 
 // 实时刷新（有新消息时更新统计，防抖避免请求密集时全量查询风暴）
@@ -659,3 +369,10 @@ onMounted(async () => {
 });
 onUnmounted(() => unlisten?.());
 </script>
+
+<style scoped>
+/* 内联详情模式下高亮选中行 */
+:deep(.agg-row-active) > td {
+  background: #e6f4ff !important;
+}
+</style>
