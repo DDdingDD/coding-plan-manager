@@ -12,11 +12,12 @@
       row-key="id"
       :pagination="false"
       size="middle"
+      :scroll="{ x: 1400 }"
     >
       <template #bodyCell="{ column, record }">
         <template v-if="column.key === 'auth_token'">
           <a-flex :gap="4" align="center">
-            <a-typography-text :code="true" :copyable="false" style="max-width: 180px" :ellipsis="true">
+            <a-typography-text :code="true" :copyable="false" style="flex: 1; min-width: 0" :ellipsis="true">
               {{ showToken[record.id] ? record.auth_token : maskToken(record.auth_token) }}
             </a-typography-text>
             <a-button size="small" type="text" @click="showToken[record.id] = !showToken[record.id]">
@@ -79,6 +80,7 @@
             style="width: 100%"
             :open="false"
             :token-separators="[',', '，']"
+            @search="(v: string) => (pendingModel = v)"
           />
         </a-form-item>
         <a-form-item label="备注">
@@ -102,9 +104,9 @@ import type { PlanView } from "../types";
 import { copyText, formatNumber } from "../utils";
 
 const columns = [
-  { title: "名称", dataIndex: "name", key: "name", width: 140 },
-  { title: "BASE_URL", dataIndex: "base_url", key: "base_url", ellipsis: true },
-  { title: "AUTH_TOKEN", key: "auth_token" },
+  { title: "名称", dataIndex: "name", key: "name", width: 130 },
+  { title: "BASE_URL", dataIndex: "base_url", key: "base_url", width: 320, ellipsis: true },
+  { title: "AUTH_TOKEN", key: "auth_token", width: 280 },
   { title: "支持模型", key: "models", width: 200 },
   { title: "备注", dataIndex: "remark", key: "remark", ellipsis: true },
   { title: "启用", key: "enabled", width: 70 },
@@ -120,6 +122,8 @@ const modalOpen = ref(false);
 const submitting = ref(false);
 const editing = ref<PlanView | null>(null);
 const form = reactive({ name: "", base_url: "", auth_token: "", remark: "", models: [] as string[] });
+// tags 输入框中尚未回车/逗号确认的文本（组件内部状态，v-model 不含），提交时补收，否则按 OK 会丢输入
+const pendingModel = ref("");
 
 const maskToken = (t: string) => (t.length > 8 ? `${t.slice(0, 5)}••••••${t.slice(-4)}` : "••••");
 
@@ -137,11 +141,13 @@ async function refresh() {
 function openCreate() {
   editing.value = null;
   Object.assign(form, { name: "", base_url: "", auth_token: "", remark: "", models: [] });
+  pendingModel.value = "";
   modalOpen.value = true;
 }
 
 function openEdit(p: PlanView) {
   editing.value = p;
+  pendingModel.value = "";
   Object.assign(form, {
     name: p.name,
     base_url: p.base_url,
@@ -152,7 +158,17 @@ function openEdit(p: PlanView) {
   modalOpen.value = true;
 }
 
+// 把输入框里未确认的文本并入 models（按中英文逗号切分、去重）
+function commitPendingModel() {
+  const parts = pendingModel.value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+  for (const p of parts) {
+    if (!form.models.includes(p)) form.models.push(p);
+  }
+  pendingModel.value = "";
+}
+
 async function submit() {
+  commitPendingModel();
   submitting.value = true;
   try {
     if (editing.value) {
