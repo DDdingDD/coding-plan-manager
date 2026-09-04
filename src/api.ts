@@ -4,6 +4,7 @@ import type {
   CodingPlan,
   MessagePage,
   MessageRow,
+  MessageSummary,
   PlanView,
   StatsBucket,
   TripStats,
@@ -175,7 +176,7 @@ export const modelStats = (p: { aggregatorId?: number | null; days?: number | nu
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-/** 订阅新消息推送（代理每次转发完成都会推送） */
-export function onNewMessage(cb: (msg: MessageRow) => void): Promise<UnlistenFn> {
-  return listen<MessageRow>("message:new", (e) => cb(e.payload));
+/** 订阅新消息推送（载荷为不含请求/响应体的摘要；监听方仅将其作为刷新触发器） */
+export function onNewMessage(cb: (msg: MessageSummary) => void): Promise<UnlistenFn> {
+  return listen<MessageSummary>("message:new", (e) => cb(e.payload));
 }

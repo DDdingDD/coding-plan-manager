@@ -365,7 +365,7 @@ function openDetail(agg: AggregatorView) {
 let unlisten: (() => void) | null = null;
 onMounted(async () => {
   await refresh();
-  unlisten = await onNewMessage(debounce(() => refresh(), 300));
+  unlisten = await onNewMessage(debounce(() => refresh(), 1500));
 });
 onUnmounted(() => unlisten?.());
 </script>

@@ -1,4 +1,4 @@
-use crate::db::{self, NewMessage};
+use crate::db::{self, MessageSummary, NewMessage};
 use crate::proxy::strategy;
 use crate::proxy::usage;
 use axum::body::{Body, Bytes};
@@ -505,9 +505,31 @@ async fn store_message(
             total_tokens: u.total_tokens,
             duration_ms,
         };
-        match db::insert_message(&conn, &msg).and_then(|id| db::get_message(&conn, id)) {
-            Ok(Some(r)) => Some(r),
-            _ => {
+        // 不再 get_message 回读整行（会搬最多 4MB 的 body 列，且发生在持锁区间），
+        // 直接由已持有字段拼出不含 body 的事件摘要
+        match db::insert_message(&conn, &msg) {
+            Ok((id, created_at)) => {
+                let (aggregator_name, plan_name) = db::lookup_names(&conn, aggregator_id, plan_id);
+                Some(MessageSummary {
+                    id,
+                    aggregator_id,
+                    plan_id,
+                    method: msg.method,
+                    path: msg.path,
+                    status,
+                    model: msg.model,
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    cache_read_tokens: u.cache_read_tokens,
+                    cache_creation_tokens: u.cache_creation_tokens,
+                    total_tokens: u.total_tokens,
+                    duration_ms,
+                    created_at,
+                    aggregator_name,
+                    plan_name,
+                })
+            }
+            Err(_) => {
                 eprintln!("[cpm] 消息落库失败");
                 None
             }

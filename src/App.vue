@@ -118,7 +118,7 @@ watch(hideOnClose, (v) => localStorage.setItem(HIDE_ON_CLOSE_KEY, v ? "1" : "0")
 onMounted(async () => {
   refreshStats();
   // 事件防抖：请求密集时避免每条消息都全量查询
-  unlisten = await onNewMessage(debounce(() => refreshStats(), 300));
+  unlisten = await onNewMessage(debounce(() => refreshStats(), 1500));
   // 拦截关闭：开启偏好时直接隐藏到托盘；否则弹确认框，确认后用 destroy() 绕过 close-requested 真正退出
   unlistenClose = await getCurrentWindow().onCloseRequested((event) => {
     event.preventDefault();

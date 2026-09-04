@@ -188,7 +188,7 @@ onMounted(async () => {
   unlisten = await onNewMessage(
     debounce(() => {
       if (realtime.value && page.value.page === 1) reload();
-    }, 300),
+    }, 1000),
   );
 });
 onUnmounted(() => unlisten?.());

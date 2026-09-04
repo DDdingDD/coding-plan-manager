@@ -170,12 +170,74 @@ pub struct StatsBucket {
 // 初始化
 // ---------------------------------------------------------------------------
 
+/// 统计覆盖索引：五项 token 计数列入索引，统计查询全程不回表。
+/// 背景：request_body/response_body（各上限 2MB）位于记录中部，表内读取其后的
+/// 统计列必须走到溢出页链尾部，全表扫描成本正比于累计 body 字节而非行数。
+/// stat_day/stat_model 纳入普通 created_at 列是覆盖判定的关键——GROUP BY/过滤
+/// 表达式引用的原始列不在索引内时 planner 会判非覆盖而回表遍历溢出页链；
+/// aggregator_id 打头使带聚合器过滤的查询获得「等值+日期范围+覆盖」完整前缀
+/// （否则 planner 偏好 stat_agg 的等值 seek 而放弃覆盖）；表达式索引须与查询
+/// 中的表达式逐字节一致才能命中。
+const STAT_INDEX_DDL: &[(&str, &str)] = &[
+    (
+        "idx_messages_stat_agg",
+        "CREATE INDEX idx_messages_stat_agg ON messages(aggregator_id, total_tokens, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens)",
+    ),
+    (
+        "idx_messages_stat_plan",
+        "CREATE INDEX idx_messages_stat_plan ON messages(plan_id, total_tokens, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens)",
+    ),
+    (
+        "idx_messages_stat_time",
+        "CREATE INDEX idx_messages_stat_time ON messages(created_at, total_tokens, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens)",
+    ),
+    (
+        "idx_messages_stat_day",
+        "CREATE INDEX idx_messages_stat_day ON messages(aggregator_id, substr(created_at,1,10), substr(created_at,12,2), created_at, total_tokens, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens)",
+    ),
+    (
+        "idx_messages_stat_model",
+        "CREATE INDEX idx_messages_stat_model ON messages(aggregator_id, model, substr(created_at,1,10), created_at, total_tokens, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens)",
+    ),
+];
+
+/// DDL 文本空白归一化后比较（sqlite_master 保留多行原文但会剥掉 IF NOT EXISTS）
+fn norm_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 确保索引存在且定义与目标 DDL 一致：CREATE INDEX IF NOT EXISTS 不会更新已
+/// 存在索引的定义，定义演进过（库里建过旧版形状）时须 DROP 重建
+fn ensure_index(conn: &Connection, name: &str, ddl: &str) -> Result<()> {
+    let have: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(h) = have.as_deref() {
+        if norm_sql(h) == norm_sql(ddl) {
+            return Ok(());
+        }
+        conn.execute(&format!("DROP INDEX {name}"), [])?;
+    }
+    conn.execute(ddl, [])?;
+    Ok(())
+}
+
 pub fn init_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
         "
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
+        -- WAL 下安全：崩溃不损坏库，最坏丢最后一次未 checkpoint 的事务
+        PRAGMA synchronous=NORMAL;
+        -- 64MB 页缓存（负数=KiB），加速索引扫描
+        PRAGMA cache_size=-65536;
+        -- GROUP BY/ORDER BY 的临时结构放内存
+        PRAGMA temp_store=MEMORY;
 
         CREATE TABLE IF NOT EXISTS coding_plans (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,12 +290,11 @@ pub fn init_db(path: &str) -> Result<Connection> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_agg   ON messages(aggregator_id, id DESC);
-        CREATE INDEX IF NOT EXISTS idx_messages_plan  ON messages(plan_id);
-        -- 按天/按小时统计以 substr(created_at,1,10) 过滤与分组，
-        -- 表达式索引须与查询中的表达式完全一致才能命中
-        CREATE INDEX IF NOT EXISTS idx_messages_date  ON messages(substr(created_at,1,10));
-        -- 小计里程按 created_at 范围过滤
-        CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+        -- 旧索引 idx_messages_plan/date/created 的前缀已被统计覆盖索引取代
+        -- （缺统计列，保留只会增加写放大）
+        DROP INDEX IF EXISTS idx_messages_plan;
+        DROP INDEX IF EXISTS idx_messages_date;
+        DROP INDEX IF EXISTS idx_messages_created;
         CREATE INDEX IF NOT EXISTS idx_agg_plans_agg  ON aggregator_plans(aggregator_id);
 
         CREATE TABLE IF NOT EXISTS settings (
@@ -242,6 +303,10 @@ pub fn init_db(path: &str) -> Result<Connection> {
         );
         ",
     )?;
+    // 统计覆盖索引：定义演进时自动 DROP 重建（见 STAT_INDEX_DDL 注释）
+    for (name, ddl) in STAT_INDEX_DDL {
+        ensure_index(&conn, name, ddl)?;
+    }
     migrate(&conn)?;
     Ok(conn)
 }
@@ -914,7 +979,10 @@ fn row_to_summary(row: &rusqlite::Row) -> Result<MessageSummary> {
     })
 }
 
-pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<i64> {
+/// 落库消息，返回 (行 id, 落库时间串)。created_at 是记录最后一列（在两个大 body
+/// 之后），回读它同样要遍历溢出页链，故随返回值带出供调用方构造事件摘要
+pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<(i64, String)> {
+    let created = now_str();
     conn.execute(
         "INSERT INTO messages (aggregator_id, plan_id, method, path, status, request_body,
                                response_body, model, prompt_tokens, completion_tokens,
@@ -936,10 +1004,40 @@ pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<i64> {
             msg.cache_creation_tokens,
             msg.total_tokens,
             msg.duration_ms,
-            now_str()
+            &created
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok((conn.last_insert_rowid(), created))
+}
+
+/// 点查聚合器/计划名（两表主键查找、小表开销为零），供事件摘要构造冗余展示名；
+/// 查不到（如计划已删除）时对应名字为 None，不影响统计主流程
+pub fn lookup_names(
+    conn: &Connection,
+    aggregator_id: i64,
+    plan_id: Option<i64>,
+) -> (Option<String>, Option<String>) {
+    let agg = conn
+        .query_row(
+            "SELECT name FROM aggregators WHERE id=?1",
+            params![aggregator_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let plan = plan_id
+        .and_then(|pid| {
+            conn.query_row(
+                "SELECT name FROM coding_plans WHERE id=?1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+    (agg, plan)
 }
 
 pub fn get_message(conn: &Connection, id: i64) -> Result<Option<MessageRow>> {
@@ -1129,6 +1227,122 @@ mod tests {
 
         assert_eq!(clear_messages(&conn, Some(agg.id)).unwrap(), 5);
         assert_eq!(global_stats(&conn).unwrap().requests, 0);
+    }
+
+    /// 索引定义演进时 ensure_index 应 DROP 重建为最新定义；定义一致时幂等
+    #[test]
+    fn ensure_index_rebuilds_on_definition_change() {
+        let conn = mem();
+        let (name, ddl) = STAT_INDEX_DDL
+            .iter()
+            .find(|(n, _)| *n == "idx_messages_stat_day")
+            .unwrap();
+        // 模拟库里残留旧版定义（缺普通 created_at 列）
+        conn.execute("DROP INDEX idx_messages_stat_day", [])
+            .unwrap();
+        conn.execute(
+            "CREATE INDEX idx_messages_stat_day ON messages(aggregator_id, \
+             substr(created_at,1,10), substr(created_at,12,2), total_tokens, \
+             prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens)",
+            [],
+        )
+        .unwrap();
+        ensure_index(&conn, name, ddl).unwrap();
+        let cur: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='idx_messages_stat_day'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(norm_sql(&cur), norm_sql(ddl));
+        // 定义已一致，再跑一次应直接返回（重建路径不会触发 DROP）
+        ensure_index(&conn, name, ddl).unwrap();
+    }
+
+    /// 回归防线：统计查询必须命中覆盖索引（idx_messages_stat_*），
+    /// 防止表达式索引书写与查询失配后悄然退化为遍历溢出页链的全表扫描
+    #[test]
+    fn stats_queries_hit_covering_indexes() {
+        let conn = mem();
+        let p1 = create_plan(&conn, "p1", "https://a", "t1", "", &[]).unwrap();
+        let agg = create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+            .unwrap();
+        // 空表时 planner 可能选全表扫描，先插入少量行
+        for i in 0..5 {
+            insert_message(
+                &conn,
+                &NewMessage {
+                    aggregator_id: agg.id,
+                    plan_id: Some(p1.id),
+                    method: "POST".into(),
+                    path: format!("/v1/messages/{i}"),
+                    status: 200,
+                    request_body: "req".into(),
+                    response_body: "resp".into(),
+                    model: if i % 2 == 0 { "glm-4.7" } else { "claude-sonnet-5" }.into(),
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    cache_read_tokens: 40,
+                    cache_creation_tokens: 20,
+                    total_tokens: 75,
+                    duration_ms: 3,
+                },
+            )
+            .unwrap();
+        }
+
+        // 统计查询形状全集（与 bucket_query 实际生成的 SQL 一致，含 ORDER BY 与聚合器过滤变体）：
+        // 累计 / 按聚合器 / 按计划 / 小计时间范围 / 按天 / 按小时 / 按模型
+        let cases = [
+            STATS_SELECT.to_string(),
+            format!("{STATS_SELECT} WHERE aggregator_id=?1"),
+            format!("{STATS_SELECT} WHERE plan_id=?1"),
+            format!("{STATS_SELECT} WHERE created_at>=?1"),
+            "SELECT substr(created_at,1,10) AS k, COALESCE(SUM(total_tokens),0), COUNT(*) \
+             FROM messages WHERE substr(created_at,1,10)>=?1 GROUP BY k ORDER BY k"
+                .to_string(),
+            "SELECT substr(created_at,1,10) AS k, COALESCE(SUM(total_tokens),0), COUNT(*) \
+             FROM messages WHERE aggregator_id=?1 AND substr(created_at,1,10)>=?2 \
+             GROUP BY k ORDER BY k"
+                .to_string(),
+            "SELECT substr(created_at,12,2) AS k, COALESCE(SUM(total_tokens),0), COUNT(*) \
+             FROM messages WHERE substr(created_at,1,10)=?1 GROUP BY k \
+             ORDER BY CAST(k AS INTEGER)"
+                .to_string(),
+            "SELECT substr(created_at,12,2) AS k, COALESCE(SUM(total_tokens),0), COUNT(*) \
+             FROM messages WHERE aggregator_id=?1 AND substr(created_at,1,10)=?2 \
+             GROUP BY k ORDER BY CAST(k AS INTEGER)"
+                .to_string(),
+            "SELECT model AS k, COALESCE(SUM(total_tokens),0), COUNT(*) \
+             FROM messages GROUP BY k ORDER BY COALESCE(SUM(total_tokens),0) DESC, k"
+                .to_string(),
+            "SELECT model AS k, COALESCE(SUM(total_tokens),0), COUNT(*) \
+             FROM messages WHERE aggregator_id=?1 GROUP BY k \
+             ORDER BY COALESCE(SUM(total_tokens),0) DESC, k"
+                .to_string(),
+            "SELECT model AS k, COALESCE(SUM(total_tokens),0), COUNT(*) \
+             FROM messages WHERE aggregator_id=?1 AND substr(created_at,1,10)>=?2 GROUP BY k \
+             ORDER BY COALESCE(SUM(total_tokens),0) DESC, k"
+                .to_string(),
+        ];
+        for sql in cases {
+            // 占位符须绑定哑值才能 EXPLAIN（取一个足够早的日期下界，不影响计划选择）
+            let dummies: Vec<&str> = vec!["1970-01-01"; sql.matches('?').count()];
+            let plans: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(dummies), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plans
+                    .iter()
+                    .any(|p| p.contains("USING COVERING INDEX idx_messages_stat")),
+                "统计查询应命中覆盖索引: {sql} -> {plans:?}"
+            );
+        }
     }
 
     #[test]

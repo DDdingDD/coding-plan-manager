@@ -236,7 +236,7 @@ onMounted(async () => {
   listAggregators().then((aggs) => {
     aggOptions.value = aggs.map((a) => ({ value: a.id, label: a.name }));
   });
-  unlisten = await onNewMessage(debounce(() => reloadAll(), 300));
+  unlisten = await onNewMessage(debounce(() => reloadAll(), 1500));
 });
 onUnmounted(() => unlisten?.());
 </script>
