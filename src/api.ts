@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AggregatorView,
   CodingPlan,
+  ImportResult,
   MessagePage,
   MessageRow,
   MessageSummary,
@@ -117,6 +118,17 @@ export const startAggregator = (id: number) =>
 
 export const stopAggregator = (id: number) =>
   invoke<AggregatorView>("stop_aggregator", { id });
+
+// ---------------------------------------------------------------------------
+// 配置导入导出
+// ---------------------------------------------------------------------------
+
+/** 导出全部计划与聚合器配置；返回写入路径（用户取消文件选择时为 null） */
+export const exportConfig = () => invoke<string | null>("export_config");
+
+/** 导入配置文件（mode：merge 追加 / replace 清空后复现）；返回导入结果（取消为 null） */
+export const importConfig = (mode: "merge" | "replace") =>
+  invoke<ImportResult | null>("import_config", { mode });
 
 // ---------------------------------------------------------------------------
 // Messages & stats

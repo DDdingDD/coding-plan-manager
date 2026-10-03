@@ -436,6 +436,36 @@ pub fn create_plan(
     })
 }
 
+/// 导入用：与 create_plan 相同，但保留 enabled 状态（create_plan 固定 enabled=1）
+pub fn create_plan_full(
+    conn: &Connection,
+    name: &str,
+    base_url: &str,
+    auth_token: &str,
+    remark: &str,
+    models: &[String],
+    enabled: bool,
+) -> Result<CodingPlan> {
+    let created = now_str();
+    let models_raw = join_models(models);
+    conn.execute(
+        "INSERT INTO coding_plans (name, base_url, auth_token, remark, models, enabled, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![name, base_url, auth_token, remark, models_raw, enabled as i64, created],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(CodingPlan {
+        id,
+        name: name.to_string(),
+        base_url: base_url.to_string(),
+        auth_token: auth_token.to_string(),
+        remark: remark.to_string(),
+        models: split_models(&models_raw),
+        enabled,
+        created_at: created,
+    })
+}
+
 pub fn update_plan(
     conn: &Connection,
     id: i64,
@@ -566,6 +596,15 @@ pub fn delete_aggregator(conn: &Connection, id: i64) -> Result<usize> {
     )?;
     let n = conn.execute("DELETE FROM aggregators WHERE id=?1", params![id])?;
     Ok(n)
+}
+
+/// 导入（替换模式）用：清空全部配置表（绑定 → 聚合器 → 计划）。
+/// messages 与 settings 不受影响（历史记录与小计里程语义独立于配置）
+pub fn clear_config(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM aggregator_plans", [])?;
+    conn.execute("DELETE FROM aggregators", [])?;
+    conn.execute("DELETE FROM coding_plans", [])?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,6 +1185,76 @@ mod tests {
         assert_eq!(got.models, vec!["glm-4.7".to_string()]);
         assert_eq!(delete_plan(&conn, p.id).unwrap(), 1);
         assert!(get_plan(&conn, p.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn plan_full_preserves_disabled() {
+        let conn = mem();
+        // create_plan 固定 enabled=1，导入路径须能落库 enabled=false
+        let p = create_plan_full(
+            &conn,
+            "p1",
+            "https://a.example",
+            "tok1",
+            "r",
+            &["glm-4.7".into()],
+            false,
+        )
+        .unwrap();
+        assert!(!p.enabled);
+        let got = get_plan(&conn, p.id).unwrap().unwrap();
+        assert!(!got.enabled);
+        assert_eq!(got.models, vec!["glm-4.7".to_string()]);
+        // enabled=true 路径同样往返
+        let p2 = create_plan_full(&conn, "p2", "https://b.example", "tok2", "", &[], true)
+            .unwrap();
+        assert!(get_plan(&conn, p2.id).unwrap().unwrap().enabled);
+    }
+
+    #[test]
+    fn clear_config_keeps_messages_and_settings() {
+        let conn = mem();
+        let p = create_plan(&conn, "p1", "https://a", "t1", "", &[]).unwrap();
+        let agg =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        set_aggregator_plans(&conn, agg.id, &[p.id]).unwrap();
+        set_current_plan(&conn, agg.id, p.id).unwrap();
+        set_setting(&conn, "trip_started_at", "2026-10-03 00:00:00").unwrap();
+        insert_message(
+            &conn,
+            &NewMessage {
+                aggregator_id: agg.id,
+                plan_id: Some(p.id),
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                status: 200,
+                request_body: "{}".into(),
+                response_body: "{}".into(),
+                model: "glm-4.7".into(),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                total_tokens: 3,
+                duration_ms: 10,
+            },
+        )
+        .unwrap();
+
+        clear_config(&conn).unwrap();
+
+        assert!(list_plans(&conn).unwrap().is_empty());
+        assert!(list_aggregators(&conn).unwrap().is_empty());
+        // messages 与 settings 不受影响（replace 导入的语义防线）
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            get_setting(&conn, "trip_started_at").unwrap(),
+            Some("2026-10-03 00:00:00".to_string())
+        );
     }
 
     #[test]

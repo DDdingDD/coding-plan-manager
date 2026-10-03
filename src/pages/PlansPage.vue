@@ -2,7 +2,10 @@
   <div>
     <a-flex justify="space-between" align="center" style="margin-bottom: 12px">
       <a-typography-title :level="4" style="margin: 0">Coding Plan</a-typography-title>
-      <a-button type="primary" @click="openCreate">新建计划</a-button>
+      <a-flex :gap="8" align="center">
+        <ConfigButtons @imported="refresh" />
+        <a-button type="primary" @click="openCreate">新建计划</a-button>
+      </a-flex>
     </a-flex>
 
     <a-table
@@ -102,6 +105,7 @@ import {
 import { createPlan, deletePlan, listPlans, updatePlan } from "../api";
 import type { PlanView } from "../types";
 import { copyText, formatNumber } from "../utils";
+import ConfigButtons from "../components/ConfigButtons.vue";
 
 const columns = [
   { title: "名称", dataIndex: "name", key: "name", width: 130 },

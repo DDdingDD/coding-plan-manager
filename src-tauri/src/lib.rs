@@ -38,6 +38,8 @@ pub fn run() {
             commands::aggregators::set_current_plan,
             commands::aggregators::start_aggregator,
             commands::aggregators::stop_aggregator,
+            commands::config::export_config,
+            commands::config::import_config,
             commands::messages::list_messages,
             commands::messages::get_message,
             commands::messages::clear_messages,

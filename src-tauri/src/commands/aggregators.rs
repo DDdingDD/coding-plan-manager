@@ -120,7 +120,7 @@ fn resolve_create_port(explicit: Option<i64>, taken: &HashSet<i64>) -> Result<i6
 }
 
 /// 在 8300..=8399 中寻找可用端口（跳过已占用端口）
-fn find_free_port(taken: &HashSet<i64>) -> Option<i64> {
+pub(crate) fn find_free_port(taken: &HashSet<i64>) -> Option<i64> {
     (8300i64..=8399).find(|&p| {
         !taken.contains(&p) && std::net::TcpListener::bind(("127.0.0.1", p as u16)).is_ok()
     })

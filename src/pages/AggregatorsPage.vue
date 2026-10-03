@@ -2,7 +2,10 @@
   <div>
     <a-flex justify="space-between" align="center" style="margin-bottom: 12px">
       <a-typography-title :level="4" style="margin: 0">Plan Aggregator</a-typography-title>
-      <a-button type="primary" @click="openCreate">新建聚合器</a-button>
+      <a-flex :gap="8" align="center">
+        <ConfigButtons @imported="onImported" />
+        <a-button type="primary" @click="openCreate">新建聚合器</a-button>
+      </a-flex>
     </a-flex>
 
     <a-table
@@ -89,7 +92,11 @@
       <a-divider orientation="left" style="margin: 20px 0 16px">
         详情：{{ inlineDetail.name }}
       </a-divider>
-      <AggregatorDetail :agg="inlineDetail" @changed="onDetailChanged" />
+      <AggregatorDetail
+        :key="`${inlineDetail.id}-${configVersion}`"
+        :agg="inlineDetail"
+        @changed="onDetailChanged"
+      />
     </template>
 
     <!-- 新建/编辑 -->
@@ -134,7 +141,12 @@
 
     <!-- 详情抽屉：聚合器数量超过 INLINE_DETAIL_MAX 个时使用（内联详情的备选形态） -->
     <a-drawer v-model:open="detailOpen" width="640" :title="detail?.name ?? ''">
-      <AggregatorDetail v-if="detail" :agg="detail" @changed="onDetailChanged" />
+      <AggregatorDetail
+        v-if="detail"
+        :key="`${detail.id}-${configVersion}`"
+        :agg="detail"
+        @changed="onDetailChanged"
+      />
     </a-drawer>
   </div>
 </template>
@@ -160,6 +172,7 @@ import {
 import type { AggregatorView, BindingView } from "../types";
 import { copyText, debounce, formatNumber } from "../utils";
 import AggregatorDetail from "../components/AggregatorDetail.vue";
+import ConfigButtons from "../components/ConfigButtons.vue";
 
 /** 路由策略标识（与 Rust 侧 db.rs 常量一致） */
 const STRATEGY_THRESHOLD_ROTATION = "threshold_rotation";
@@ -230,6 +243,17 @@ async function onDetailChanged(updated: AggregatorView) {
   const idx = aggs.value.findIndex((a) => a.id === updated.id);
   if (idx >= 0) aggs.value[idx] = updated;
   if (detail.value?.id === updated.id) detail.value = updated;
+  await refresh();
+}
+
+/** 导入配置成功：刷新列表，并以 configVersion 递增强制详情组件重挂载——
+ * 组件在 onMounted 缓存了可绑定计划列表，merge 新增计划 / replace 全量
+ * 换 id 后旧缓存已失活，仅靠列表刷新覆盖不到 */
+const configVersion = ref(0);
+async function onImported() {
+  configVersion.value++;
+  selectedId.value = null;
+  detailOpen.value = false;
   await refresh();
 }
 

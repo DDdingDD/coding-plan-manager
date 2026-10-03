@@ -27,6 +27,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 futures-util = "0.3"
 rand = "0.8"
 chrono = "0.4"
+# 原生保存/打开文件对话框（tauri-plugin-dialog 的底层实现）。
+# Windows 走 IFileDialog COM，不依赖 comctl32 v6 —— 刻意不启用其
+# common-controls-v6 特性（与上方 tauri 的坑同源），测试二进制安全
+rfd = "0.15"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

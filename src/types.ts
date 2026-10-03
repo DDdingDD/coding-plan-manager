@@ -124,3 +124,18 @@ export interface MessagePage {
   page_size: number;
   items: MessageSummary[];
 }
+
+/** 端口冲突自动改配的明细（导入结果） */
+export interface PortChange {
+  name: string;
+  old_port: number;
+  new_port: number;
+}
+
+/** import_config 返回：导入计数与提示明细（用户取消文件选择时命令返回 null） */
+export interface ImportResult {
+  plans_imported: number;
+  aggregators_imported: number;
+  port_changes: PortChange[];
+  stopped_servers: number;
+}
