@@ -9,15 +9,16 @@ const TRAY_ID_SHOW: &str = "tray_show";
 /// 菜单项标识：退出程序
 const TRAY_ID_QUIT: &str = "tray_quit";
 
-/// 创建系统托盘图标与菜单，在 app setup 阶段调用一次
-pub fn setup_tray(app: &App) -> tauri::Result<()> {
+/// 创建系统托盘图标与菜单，在 app setup 阶段调用一次。
+/// 错误上抛到 lib.rs run() 的启动失败弹窗显示，不再 expect 静默崩
+pub fn setup_tray(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(app, TRAY_ID_SHOW, "显示主窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, TRAY_ID_QUIT, "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quit])?;
 
     let icon = app
         .default_window_icon()
-        .expect("打包配置已提供窗口图标，托盘图标可直接复用")
+        .ok_or("打包配置缺少窗口图标，托盘图标无法创建")?
         .clone();
 
     TrayIconBuilder::with_id("main-tray")

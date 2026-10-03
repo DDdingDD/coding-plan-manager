@@ -228,6 +228,12 @@ fn ensure_index(conn: &Connection, name: &str, ddl: &str) -> Result<()> {
 
 pub fn init_db(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    init_schema(&conn)?;
+    Ok(conn)
+}
+
+/// 建表/补列/建索引，作用于给定连接（init_db 与测试共用，便于预置旧库验证升级路径）
+fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         PRAGMA journal_mode=WAL;
@@ -303,12 +309,15 @@ pub fn init_db(path: &str) -> Result<Connection> {
         );
         ",
     )?;
+    // 先补列后建索引：统计覆盖索引引用 cache_read/cache_creation/model 等迁移列，
+    // 旧库若先 ensure_index 会因 no such column 直接失败——安装包在装过旧版的机器上
+    // 打开即闪退的根因（残留旧 schema 的 cpm.db）
+    migrate(conn)?;
     // 统计覆盖索引：定义演进时自动 DROP 重建（见 STAT_INDEX_DDL 注释）
     for (name, ddl) in STAT_INDEX_DDL {
-        ensure_index(&conn, name, ddl)?;
+        ensure_index(conn, name, ddl)?;
     }
-    migrate(&conn)?;
-    Ok(conn)
+    Ok(())
 }
 
 /// 旧库增量迁移：缺列则补（messages 的 model/缓存 token、coding_plans 的 models、
@@ -1367,6 +1376,63 @@ mod tests {
         assert_eq!(norm_sql(&cur), norm_sql(ddl));
         // 定义已一致，再跑一次应直接返回（重建路径不会触发 DROP）
         ensure_index(&conn, name, ddl).unwrap();
+    }
+
+    /// 回归防线：旧版库（messages 无 model/cache 列、coding_plans 无 models、
+    /// aggregators 无 current_plan_id）走完整 init_schema 必须先补列再建索引，
+    /// 否则 ensure_index 引用不存在列报 "no such column"——安装包在装过旧版的
+    /// 机器上打开即闪退的根因
+    #[test]
+    fn init_schema_on_legacy_db_migrates_before_indexing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, aggregator_id INTEGER NOT NULL,
+                plan_id INTEGER, method TEXT NOT NULL DEFAULT '', path TEXT NOT NULL DEFAULT '',
+                status INTEGER NOT NULL DEFAULT 0, request_body TEXT NOT NULL DEFAULT '',
+                response_body TEXT NOT NULL DEFAULT '', prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+            CREATE TABLE coding_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, base_url TEXT NOT NULL,
+                auth_token TEXT NOT NULL, remark TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+            CREATE TABLE aggregators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, port INTEGER NOT NULL,
+                auth_token TEXT NOT NULL, strategy TEXT NOT NULL DEFAULT 'threshold_rotation',
+                token_threshold INTEGER NOT NULL DEFAULT 1000000, created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap(); // 幂等
+
+        let cols = |table: &str| -> Vec<String> {
+            let mut v = Vec::new();
+            let mut stmt = conn
+                .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                .unwrap();
+            for r in stmt.query_map([], |row| row.get::<_, String>(0)).unwrap() {
+                v.push(r.unwrap());
+            }
+            v
+        };
+        let msg = cols("messages");
+        for c in ["model", "cache_read_tokens", "cache_creation_tokens"] {
+            assert!(msg.iter().any(|x| x == c), "迁移后 messages 应有列 {c}");
+        }
+        for (name, _) in STAT_INDEX_DDL {
+            let exists = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1",
+                    params![name],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some();
+            assert!(exists, "统计索引 {name} 应已建成");
+        }
     }
 
     /// 回归防线：统计查询必须命中覆盖索引（idx_messages_stat_*），
