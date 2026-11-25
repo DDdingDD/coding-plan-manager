@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AggregatorView,
   CodingPlan,
+  DbInfo,
   ImportResult,
   MessagePage,
   MessageRow,
@@ -149,6 +150,9 @@ export const getMessage = (id: number) => invoke<MessageRow>("get_message", { id
 
 export const clearMessages = (aggregatorId?: number | null) =>
   invoke<number>("clear_messages", { aggregatorId: aggregatorId ?? null });
+
+/** 数据库实际路径及主库、WAL、SHM 文件大小（字节） */
+export const getDbInfo = () => invoke<DbInfo>("get_db_info");
 
 export const globalStats = () => invoke<UsageStats>("global_stats");
 

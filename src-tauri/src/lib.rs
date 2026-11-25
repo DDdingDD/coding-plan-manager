@@ -31,6 +31,7 @@ pub fn run() {
                 db::init_db(db_path.to_string_lossy().as_ref()).map_err(|e| e.to_string())?;
             app.manage(state::AppState {
                 db: Arc::new(Mutex::new(conn)),
+                db_path: db_path.clone(),
                 servers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             });
             tray::setup_tray(app)?;
@@ -73,6 +74,7 @@ pub fn run() {
             commands::messages::daily_stats,
             commands::messages::hourly_stats,
             commands::messages::model_stats,
+            commands::system::get_db_info,
         ])
         .run(tauri::generate_context!())
     {

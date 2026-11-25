@@ -13,6 +13,21 @@ export function formatNumber(n: number | undefined | null): string {
   return (n ?? 0).toLocaleString();
 }
 
+/** 按 1024 进制格式化文件字节数 */
+export function formatBytes(n: number | undefined | null): string {
+  if (n == null || !Number.isFinite(n) || n < 0) return "—";
+  if (n < 1024) return `${n} B`;
+
+  const units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+  let value = n / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${Number(value.toFixed(2))} ${units[unit]}`;
+}
+
 export async function copyText(text: string, tip = "已复制") {
   try {
     await navigator.clipboard.writeText(text);

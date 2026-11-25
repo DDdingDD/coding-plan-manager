@@ -1,5 +1,13 @@
 // 与 Rust 侧 serde 序列化结构一一对应（snake_case）
 
+export interface DbInfo {
+  db_path: string;
+  db_size: number;
+  wal_size: number;
+  shm_size: number;
+  total_size: number;
+}
+
 export interface UsageStats {
   total_tokens: number;
   prompt_tokens: number;
