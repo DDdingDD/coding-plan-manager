@@ -77,10 +77,10 @@
             {{ detail.plan_name ?? "（未使用）" }}
           </a-descriptions-item>
           <a-descriptions-item label="请求" :span="2">
-            <span style="font-family: monospace">{{ detail.method }} {{ detail.path }}</span>
+            <span class="wrap-value monospace">{{ detail.method }} {{ detail.path }}</span>
           </a-descriptions-item>
           <a-descriptions-item label="模型" :span="2">
-            {{ detail.model || "（未知）" }}
+            <span class="wrap-value">{{ detail.model || "（未知）" }}</span>
           </a-descriptions-item>
           <a-descriptions-item label="Token" :span="2">
             总 {{ formatNumber(detail.total_tokens) }}｜入 {{ formatNumber(detail.prompt_tokens) }}｜出
@@ -93,22 +93,27 @@
           <a-descriptions-item label="耗时">{{ detail.duration_ms }} ms</a-descriptions-item>
         </a-descriptions>
 
-        <a-tabs>
-          <a-tab-pane key="req" tab="请求体">
-            <pre class="body-view">{{ prettyJson(detail.request_body) }}</pre>
-          </a-tab-pane>
-          <a-tab-pane key="resp" tab="响应体">
-            <pre class="body-view">{{ prettyJson(detail.response_body) }}</pre>
-          </a-tab-pane>
-        </a-tabs>
+        <MessageSequence :message="detail" @open-body="openBody" />
+
+        <div ref="bodySection" class="body-section">
+          <a-tabs v-model:activeKey="activeBodyTab">
+            <a-tab-pane key="req" tab="请求体">
+              <pre class="body-view">{{ prettyJson(detail.request_body) || "（无已记录的请求体）" }}</pre>
+            </a-tab-pane>
+            <a-tab-pane key="resp" tab="响应体">
+              <pre class="body-view">{{ prettyJson(detail.response_body) || "（无已记录的响应体）" }}</pre>
+            </a-tab-pane>
+          </a-tabs>
+        </div>
       </template>
     </a-drawer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
+import { nextTick, onMounted, onUnmounted, ref } from "vue";
 import { message } from "ant-design-vue";
+import MessageSequence from "../components/MessageSequence.vue";
 import {
   clearMessages,
   getMessage,
@@ -159,14 +164,27 @@ const reload = () => loadPage(1);
 
 const detailOpen = ref(false);
 const detail = ref<MessageRow | null>(null);
+const activeBodyTab = ref<"req" | "resp">("req");
+const bodySection = ref<HTMLElement | null>(null);
 
 async function openDetail(id: number) {
   try {
     detail.value = await getMessage(id);
+    activeBodyTab.value = "req";
     detailOpen.value = true;
   } catch (e) {
     message.error(String(e));
   }
+}
+
+async function openBody(kind: "req" | "resp") {
+  activeBodyTab.value = kind;
+  await nextTick();
+  const section = bodySection.value;
+  section?.scrollIntoView({ block: "nearest" });
+  section
+    ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+    ?.focus({ preventScroll: true });
 }
 
 async function doClear() {
@@ -195,6 +213,18 @@ onUnmounted(() => unlisten?.());
 </script>
 
 <style scoped>
+.wrap-value {
+  overflow-wrap: anywhere;
+}
+
+.monospace {
+  font-family: monospace;
+}
+
+.body-section {
+  scroll-margin-top: 12px;
+}
+
 .body-view {
   background: #fafafa;
   border: 1px solid #f0f0f0;
