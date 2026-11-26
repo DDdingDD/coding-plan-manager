@@ -151,8 +151,17 @@ export const getMessage = (id: number) => invoke<MessageRow>("get_message", { id
 export const clearMessages = (aggregatorId?: number | null) =>
   invoke<number>("clear_messages", { aggregatorId: aggregatorId ?? null });
 
-/** 数据库实际路径及主库、WAL、SHM 文件大小（字节） */
+/** 数据库路径、文件大小、页级统计与维护任务状态（配置页轮询） */
 export const getDbInfo = () => invoke<DbInfo>("get_db_info");
+
+/** 启动历史消息压缩（后台、无损、可取消续跑；同一时刻只允许一个维护任务） */
+export const startCompressMessages = () => invoke<void>("start_compress_messages");
+
+/** 整理数据库文件（VACUUM）：需先停止全部聚合器，期间数据库完全锁定 */
+export const startVacuum = () => invoke<void>("start_vacuum");
+
+/** 取消当前维护任务，返回是否确有任务在运行 */
+export const cancelMaintenance = () => invoke<boolean>("cancel_maintenance");
 
 export const globalStats = () => invoke<UsageStats>("global_stats");
 

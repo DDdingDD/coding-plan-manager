@@ -1,5 +1,7 @@
+pub mod body;
 mod commands;
 pub mod db;
+pub mod maintenance;
 pub mod proxy;
 mod state;
 mod token;
@@ -26,13 +28,21 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-            let db_path = dir.join("cpm.db");
+            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            let mut db_path = dir.join("cpm.db");
+            // 调试构建可用环境变量把库指到别处（对着副本验证迁移/压缩，不碰真实库）
+            #[cfg(debug_assertions)]
+            if let Some(p) = std::env::var_os("CPM_DB_PATH").filter(|p| !p.is_empty()) {
+                db_path = p.into();
+            }
             let conn =
                 db::init_db(db_path.to_string_lossy().as_ref()).map_err(|e| e.to_string())?;
             app.manage(state::AppState {
                 db: Arc::new(Mutex::new(conn)),
                 db_path: db_path.clone(),
                 servers: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                bodies: Arc::new(body::BodyStore::new()),
+                maintenance: Arc::new(maintenance::Maintenance::new()),
             });
             tray::setup_tray(app)?;
             // 窗口配置为 create:false：tauri 默认在用户 setup 之前就建窗加载前端，
@@ -75,6 +85,9 @@ pub fn run() {
             commands::messages::hourly_stats,
             commands::messages::model_stats,
             commands::system::get_db_info,
+            commands::maintenance::start_compress_messages,
+            commands::maintenance::start_vacuum,
+            commands::maintenance::cancel_maintenance,
         ])
         .run(tauri::generate_context!())
     {

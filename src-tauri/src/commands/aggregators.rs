@@ -261,6 +261,9 @@ pub async fn delete_aggregator(state: tauri::State<'_, AppState>, id: i64) -> Re
     if n == 0 {
         return Err("聚合器不存在".into());
     }
+    // 聚合器 id 为 AUTOINCREMENT 不会复用，其前缀缓存再无命中机会，顺手释放
+    // （消息行保留：历史记录不随配置删除）
+    state.bodies.remove_aggregator(id);
     Ok(())
 }
 
@@ -328,6 +331,11 @@ pub async fn start_aggregator(
             return get_view(&state, id);
         }
     }
+    // 整理文件期间数据库连接被 VACUUM 独占：此刻启动的聚合器，其首个请求会挂起
+    // 数分钟。与 start_vacuum 的「先停聚合器」校验互为一对
+    if let Some(msg) = crate::commands::maintenance::vacuum_blocker(&state.maintenance) {
+        return Err(msg);
+    }
     let agg = {
         let conn = lock(&state);
         db::get_aggregator(&conn, id)
@@ -335,7 +343,7 @@ pub async fn start_aggregator(
             .ok_or("聚合器不存在")?
     };
     let db_clone: Arc<Mutex<rusqlite::Connection>> = state.db.clone();
-    let running = proxy::start_server(Some(app), db_clone, agg).await?;
+    let running = proxy::start_server(Some(app), db_clone, agg, state.bodies.clone()).await?;
     state.servers.lock().unwrap().insert(
         id,
         RunningServer {

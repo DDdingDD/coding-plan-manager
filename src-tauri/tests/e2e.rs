@@ -4,6 +4,7 @@
 use axum::body::Body;
 use axum::extract::Request;
 use axum::response::Response;
+use coding_plan_manager_lib::body;
 use coding_plan_manager_lib::db;
 use coding_plan_manager_lib::proxy::{self, ProxyShared};
 use http_body_util::BodyExt;
@@ -223,6 +224,7 @@ async fn setup_router(
     let shared = Arc::new(ProxyShared {
         aggregator_id: agg_id,
         db: conn.clone(),
+        bodies: Arc::new(body::BodyStore::new()),
         client: reqwest::Client::new(),
         app: None,
     });
@@ -260,6 +262,7 @@ async fn e2e_auth_rotation_stats_and_wraparound() {
     let shared = Arc::new(ProxyShared {
         aggregator_id: agg.id,
         db: conn.clone(),
+        bodies: Arc::new(body::BodyStore::new()),
         client: reqwest::Client::new(),
         app: None,
     });
@@ -355,6 +358,7 @@ async fn e2e_sse_stream_usage() {
     let shared = Arc::new(ProxyShared {
         aggregator_id: agg.id,
         db: conn.clone(),
+        bodies: Arc::new(body::BodyStore::new()),
         client: reqwest::Client::new(),
         app: None,
     });
@@ -404,6 +408,7 @@ async fn e2e_upstream_unreachable_502() {
     let shared = Arc::new(ProxyShared {
         aggregator_id: agg.id,
         db: conn.clone(),
+        bodies: Arc::new(body::BodyStore::new()),
         client: reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(3))
             .build()
@@ -443,6 +448,7 @@ async fn e2e_no_plan_503() {
     let shared = Arc::new(ProxyShared {
         aggregator_id: agg.id,
         db: conn.clone(),
+        bodies: Arc::new(body::BodyStore::new()),
         client: reqwest::Client::new(),
         app: None,
     });
@@ -476,7 +482,7 @@ async fn e2e_tcp_server_start_stop() {
     };
 
     // 启动真实服务
-    let server = proxy::start_server(None, conn.clone(), agg.clone())
+    let server = proxy::start_server(None, conn.clone(), agg.clone(), Arc::new(body::BodyStore::new()))
         .await
         .expect("端口绑定与启动应成功");
 
@@ -512,6 +518,91 @@ async fn e2e_tcp_server_start_stop() {
         .send()
         .await;
     assert!(closed.is_err(), "停止服务后端口应不再接受连接");
+}
+
+/// 请求体前缀增量落库：三请求共享 30KB+ 前缀逐轮增长，第 2/3 行只存新增后缀并引用
+/// 前一行；get_message 还原的请求体与发送体逐字节一致
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_request_body_delta_roundtrip() {
+    let (upstream, _captured) = spawn_mock_upstream(MockMode::Json).await;
+    let conn: Conn = Arc::new(Mutex::new(db::init_db(":memory:").unwrap()));
+    let agg = {
+        let c = lock(&conn);
+        let p = db::create_plan(&c, "D", &upstream, "tokD", "", &[]).unwrap();
+        let agg = db::create_aggregator(
+            &c,
+            "g",
+            8313,
+            "cpm-delta",
+            1_000_000,
+            db::STRATEGY_THRESHOLD_ROTATION,
+        )
+        .unwrap();
+        db::set_aggregator_plans(&c, agg.id, &[p.id]).unwrap();
+        agg
+    };
+    let shared = Arc::new(ProxyShared {
+        aggregator_id: agg.id,
+        db: conn.clone(),
+        bodies: Arc::new(body::BodyStore::new()),
+        client: reqwest::Client::new(),
+        app: None,
+    });
+    let router = proxy::build_router(shared);
+
+    let sys = "系统提示词。".repeat(2000);
+    let sent: Vec<String> = (0..3)
+        .map(|turn| {
+            format!(
+                r#"{{"model":"claude-x","stream":false,"messages":[{{"role":"system","content":"{sys}"}},{{"role":"user","content":"第 {turn} 轮：{}"}}]}}"#,
+                "问题".repeat(turn + 1)
+            )
+        })
+        .collect();
+    for b in &sent {
+        let (status, body) = send_raw(
+            &router,
+            "POST",
+            "/v1/messages",
+            &[("authorization", "Bearer cpm-delta".to_string())],
+            b,
+        )
+        .await;
+        assert_eq!(status, 200, "转发应成功: {body}");
+    }
+    wait_for_messages(&conn, agg.id, 3).await;
+
+    let c = lock(&conn);
+    let (_, items) = db::list_messages(&c, Some(agg.id), 10, 0).unwrap();
+    let mut ids: Vec<i64> = items.iter().map(|m| m.id).collect();
+    ids.sort(); // 列表按 id 倒序，改为按发送顺序
+    assert_eq!(ids.len(), 3);
+    for (i, id) in ids.iter().enumerate() {
+        let m = db::get_message(&c, *id).unwrap().unwrap();
+        assert_eq!(m.request_body, sent[i], "第 {} 条请求体应逐字节一致", i + 1);
+        assert_eq!(m.response_body, r#"{"id":"m1","usage":{"input_tokens":50,"output_tokens":10}}"#);
+    }
+
+    let stored = |id: i64| -> (String, Option<i64>, Option<i64>, i64) {
+        c.query_row(
+            "SELECT typeof(request_body), req_ref_id, req_prefix_len, octet_length(request_body)
+             FROM messages WHERE id=?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    };
+    // 首行整条存储（zstd），其后两行只存相对前一行的后缀
+    let (kind, ref_id, plen, len) = stored(ids[0]);
+    assert_eq!((kind.as_str(), ref_id, plen), ("blob", None, None));
+    assert!(len < sent[0].len() as i64 / 2, "整条应被压缩：{len}");
+    for i in 1..3 {
+        let (kind, ref_id, plen, len) = stored(ids[i]);
+        assert_eq!(kind, "blob");
+        assert_eq!(ref_id, Some(ids[i - 1]), "第 {} 条应引用前一条", i + 1);
+        assert!(plen.unwrap() > 16 * 1024, "前缀应覆盖公共部分");
+        assert!(len < 512, "第 {} 条只存后缀：{len} 字节", i + 1);
+    }
 }
 
 /// x-api-key 鉴权：正确令牌放行，错误令牌 401（Claude Code 实际使用该头）
@@ -729,6 +820,7 @@ async fn e2e_model_match_routing() {
     let shared = Arc::new(ProxyShared {
         aggregator_id: agg.id,
         db: conn.clone(),
+        bodies: Arc::new(body::BodyStore::new()),
         client: reqwest::Client::new(),
         app: None,
     });

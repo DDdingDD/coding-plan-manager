@@ -6,6 +6,45 @@ export interface DbInfo {
   wal_size: number;
   shm_size: number;
   total_size: number;
+  /** 页级统计：拿不到数据库锁（整理文件期间）时为 null */
+  page_size: number | null;
+  page_count: number | null;
+  freelist_count: number | null;
+  /** 可回收字节数（空闲页）：压缩历史 / 删除消息腾出，整理文件后归还文件系统 */
+  reclaimable_bytes: number | null;
+  /** 整理后的预计大小 */
+  estimated_size: number | null;
+  /** 仍为明文（未压缩）的消息行数 */
+  legacy_rows: number | null;
+  running_aggregators: number;
+  /** 进行中的维护任务（同一时刻最多一个） */
+  job: MaintenanceJob | null;
+  /** 最近一次维护任务的结局（应用重启后清空） */
+  last_result: MaintenanceResult | null;
+}
+
+export type MaintenanceKind = "compress" | "vacuum";
+
+export interface MaintenanceJob {
+  kind: MaintenanceKind;
+  elapsed_ms: number;
+  /** 估算完成度 0..1；整理文件得知不了总量，恒为 0 */
+  fraction: number;
+  stage: string;
+  rows_done: number;
+  bytes_in: number;
+  bytes_out: number;
+  /** 已请求取消，等待当前批结束 */
+  cancelling: boolean;
+}
+
+export type MaintenanceOutcome = "completed" | "cancelled" | "failed";
+
+export interface MaintenanceResult {
+  kind: MaintenanceKind;
+  outcome: MaintenanceOutcome;
+  message: string;
+  elapsed_ms: number;
 }
 
 export interface UsageStats {

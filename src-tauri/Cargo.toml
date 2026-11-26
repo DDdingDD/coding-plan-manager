@@ -23,7 +23,11 @@ tokio-util = "0.7"
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "system-proxy"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+# hooks：progress_handler（VACUUM 取消）受该特性门控
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+# 消息体落库压缩。C 库经 cc 编译（ring 已带入 cc，MSVC 下无新工具链要求）；
+# 不需要 legacy 旧格式解码与 zdict 词典构建
+zstd = { version = "0.13", default-features = false }
 futures-util = "0.3"
 rand = "0.8"
 chrono = "0.4"

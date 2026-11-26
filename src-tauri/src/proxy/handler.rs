@@ -1,3 +1,4 @@
+use crate::body;
 use crate::db::{self, MessageSummary, NewMessage};
 use crate::proxy::strategy;
 use crate::proxy::usage;
@@ -49,6 +50,8 @@ const SKIP_RESP_HEADERS: &[&str] = &[
 pub struct ProxyShared {
     pub aggregator_id: i64,
     pub db: Arc<Mutex<Connection>>,
+    /// 请求体前缀增量缓存（与 AppState.bodies、维护任务之外的全体写入方共用同一份）
+    pub bodies: Arc<body::BodyStore>,
     pub client: reqwest::Client,
     pub app: Option<tauri::AppHandle>,
 }
@@ -507,7 +510,7 @@ async fn store_message(
         };
         // 不再 get_message 回读整行（会搬最多 4MB 的 body 列，且发生在持锁区间），
         // 直接由已持有字段拼出不含 body 的事件摘要
-        match db::insert_message(&conn, &msg) {
+        match db::insert_message(&conn, &msg, &shared.bodies) {
             Ok((id, created_at)) => {
                 let (aggregator_name, plan_name) = db::lookup_names(&conn, aggregator_id, plan_id);
                 Some(MessageSummary {

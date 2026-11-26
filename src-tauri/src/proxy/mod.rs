@@ -2,6 +2,7 @@ pub mod handler;
 pub mod strategy;
 pub mod usage;
 
+use crate::body;
 use crate::db;
 use crate::state::RunningServer;
 use axum::routing::any;
@@ -19,10 +20,12 @@ pub fn build_router(shared: Arc<ProxyShared>) -> Router {
 
 /// 启动一个聚合器的对外服务：绑定端口 + spawn Axum（可优雅关停）。
 /// app 为 None 时不向前端推送事件（用于测试）。
+/// bodies 为全体写入方共用的请求体前缀缓存（与 AppState.bodies 同一份）。
 pub async fn start_server(
     app: Option<tauri::AppHandle>,
     db_conn: Arc<Mutex<Connection>>,
     aggregator: db::Aggregator,
+    bodies: Arc<body::BodyStore>,
 ) -> Result<RunningServer, String> {
     let addr = format!("127.0.0.1:{}", aggregator.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -35,6 +38,7 @@ pub async fn start_server(
     let shared = Arc::new(ProxyShared {
         aggregator_id: aggregator.id,
         db: db_conn,
+        bodies,
         client: build_client(),
         app,
     });

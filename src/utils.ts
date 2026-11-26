@@ -28,6 +28,15 @@ export function formatBytes(n: number | undefined | null): string {
   return `${Number(value.toFixed(2))} ${units[unit]}`;
 }
 
+/** 毫秒时长的可读描述（秒 / 分秒 / 小时分） */
+export function formatDuration(ms: number | undefined | null): string {
+  const s = Math.floor((ms ?? 0) / 1000);
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} 分 ${String(s % 60).padStart(2, "0")} 秒`;
+  return `${Math.floor(m / 60)} 小时 ${m % 60} 分`;
+}
+
 export async function copyText(text: string, tip = "已复制") {
   try {
     await navigator.clipboard.writeText(text);

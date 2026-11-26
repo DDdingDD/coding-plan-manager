@@ -1,5 +1,9 @@
+use crate::body::{self, BodyStore};
+use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OptionalExtension, Result, ToSql};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// 轮转策略标识：阈值轮转（按绑定顺序 + token 阈值）
 pub const STRATEGY_THRESHOLD_ROTATION: &str = "threshold_rotation";
@@ -201,6 +205,14 @@ const STAT_INDEX_DDL: &[(&str, &str)] = &[
     ),
 ];
 
+/// 「未压缩行」部分索引：只收录请求体仍为明文（TEXT，旧库写入）的行。新行一律以
+/// BLOB 落库、不进本索引，日常写入零写放大。它让三件事不碰大表：
+/// 是否还有待压缩行（O(1)）、待压缩行数（只数索引）、回填的游标扫描
+/// （WHERE id>? AND typeof(...)='text' ORDER BY id → SEARCH 本索引）。
+/// 表达式须与查询逐字节一致才能命中
+const LEGACY_INDEX_DDL: &str =
+    "CREATE INDEX idx_messages_legacy ON messages(id) WHERE typeof(request_body)='text'";
+
 /// DDL 文本空白归一化后比较（sqlite_master 保留多行原文但会剥掉 IF NOT EXISTS）
 fn norm_sql(sql: &str) -> String {
     sql.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -242,7 +254,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
         PRAGMA synchronous=NORMAL;
         -- 64MB 页缓存（负数=KiB），加速索引扫描
         PRAGMA cache_size=-65536;
-        -- GROUP BY/ORDER BY 的临时结构放内存
+        -- GROUP BY/ORDER BY 的临时结构放内存。
+        -- 注意 VACUUM 的临时库同样受它支配：整理文件前须临时改回 FILE（见 vacuum）
         PRAGMA temp_store=MEMORY;
 
         CREATE TABLE IF NOT EXISTS coding_plans (
@@ -292,7 +305,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
             cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens      INTEGER NOT NULL DEFAULT 0,
             duration_ms       INTEGER NOT NULL DEFAULT 0,
-            created_at        TEXT NOT NULL
+            created_at        TEXT NOT NULL,
+            -- 前缀增量（见 body 模块）：请求体前缀取自 req_ref_id 行的请求体，
+            -- 本行 request_body 只存其后 req_prefix_len 字节起始的后缀；NULL = 整条。
+            -- request_body/response_body 列声明仍为 TEXT：编码后的 BLOB 原样存储，
+            -- 读取按存储类区分（TEXT = 旧库明文）
+            req_ref_id        INTEGER,
+            req_prefix_len    INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_messages_agg   ON messages(aggregator_id, id DESC);
@@ -317,11 +336,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
     for (name, ddl) in STAT_INDEX_DDL {
         ensure_index(conn, name, ddl)?;
     }
+    // 未压缩行部分索引（旧库首启在此建立：只读各行的记录头，不读 body 溢出页）
+    ensure_index(conn, "idx_messages_legacy", LEGACY_INDEX_DDL)?;
     Ok(())
 }
 
-/// 旧库增量迁移：缺列则补（messages 的 model/缓存 token、coding_plans 的 models、
-/// aggregators 的 current_plan_id）
+/// 旧库增量迁移：缺列则补（messages 的 model/缓存 token 与引用列、coding_plans 的
+/// models、aggregators 的 current_plan_id）
 fn migrate(conn: &Connection) -> Result<()> {
     let mut has: Vec<String> = Vec::new();
     {
@@ -349,6 +370,8 @@ fn migrate(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    ensure_column(conn, "messages", "req_ref_id", "INTEGER")?;
+    ensure_column(conn, "messages", "req_prefix_len", "INTEGER")?;
     ensure_column(conn, "coding_plans", "models", "TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "aggregators", "current_plan_id", "INTEGER")?;
     Ok(())
@@ -970,22 +993,86 @@ pub fn stats_by_model(
 // 消息
 // ---------------------------------------------------------------------------
 
+/// get_message 的列集。两个 body 列排在统计列之前，引用两列追加在末尾（旧库经
+/// ALTER 补列后的物理顺序与此一致）
 const MSG_COLS: &str = "m.id, m.aggregator_id, m.plan_id, m.method, m.path, m.status, \
                         m.request_body, m.response_body, m.model, m.prompt_tokens, \
                         m.completion_tokens, m.cache_read_tokens, m.cache_creation_tokens, \
                         m.total_tokens, m.duration_ms, m.created_at, \
-                        a.name, p.name";
+                        a.name, p.name, m.req_ref_id, m.req_prefix_len";
 
-fn row_to_message(row: &rusqlite::Row) -> Result<MessageRow> {
-    Ok(MessageRow {
+/// 落库的 body 列：原始字节 + 存储类是否为 BLOB（已编码；TEXT 为旧库明文）
+#[derive(Debug, Clone)]
+struct StoredBody {
+    bytes: Vec<u8>,
+    encoded: bool,
+}
+
+impl StoredBody {
+    /// 取一行的第 idx 列。body 列只能这样按原始字节读：`row.get::<_, String>`
+    /// 遇到 BLOB 会报 InvalidColumnType
+    fn from_row(row: &rusqlite::Row, idx: usize) -> Result<Self> {
+        let (bytes, encoded) = match row.get_ref(idx)? {
+            ValueRef::Text(b) => (b.to_vec(), false),
+            ValueRef::Blob(b) => (b.to_vec(), true),
+            // 两列均为 NOT NULL；万一出现 NULL/数值按空体处理，不让整条详情失败
+            _ => (Vec::new(), false),
+        };
+        Ok(Self { bytes, encoded })
+    }
+
+    /// 解码为落库前的字节：编码过的走 body::decode，明文原样返回
+    fn decode(&self) -> std::result::Result<Vec<u8>, String> {
+        if self.encoded {
+            body::decode(&self.bytes)
+        } else {
+            Ok(self.bytes.clone())
+        }
+    }
+
+    /// 解码为落库前的文本；数据损坏时正文位置给出中文标记
+    fn to_text(&self) -> String {
+        match self.decode() {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => format!("…[{e}]\n"),
+        }
+    }
+}
+
+/// get_message 的原始行：两个 body 保持落库形态，由 to_message_row 解码
+struct RawMessage {
+    id: i64,
+    aggregator_id: i64,
+    plan_id: Option<i64>,
+    method: String,
+    path: String,
+    status: i64,
+    request_body: StoredBody,
+    response_body: StoredBody,
+    model: String,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_tokens: i64,
+    total_tokens: i64,
+    duration_ms: i64,
+    created_at: String,
+    aggregator_name: Option<String>,
+    plan_name: Option<String>,
+    req_ref_id: Option<i64>,
+    req_prefix_len: Option<i64>,
+}
+
+fn row_to_raw(row: &rusqlite::Row) -> Result<RawMessage> {
+    Ok(RawMessage {
         id: row.get(0)?,
         aggregator_id: row.get(1)?,
         plan_id: row.get(2)?,
         method: row.get(3)?,
         path: row.get(4)?,
         status: row.get(5)?,
-        request_body: row.get(6)?,
-        response_body: row.get(7)?,
+        request_body: StoredBody::from_row(row, 6)?,
+        response_body: StoredBody::from_row(row, 7)?,
         model: row.get(8)?,
         prompt_tokens: row.get(9)?,
         completion_tokens: row.get(10)?,
@@ -996,6 +1083,148 @@ fn row_to_message(row: &rusqlite::Row) -> Result<MessageRow> {
         created_at: row.get(15)?,
         aggregator_name: row.get(16)?,
         plan_name: row.get(17)?,
+        req_ref_id: row.get(18)?,
+        req_prefix_len: row.get(19)?,
+    })
+}
+
+/// 引用链回溯的跳数上限：正常数据链深不超过 body::MAX_DEPTH，超限说明库被异常改动
+/// （成环等），到顶即按引用断裂处理
+const MAX_REF_HOPS: usize = 256;
+
+/// 按主键取来源行的请求体落库形态及其引用信息（引用链回溯用）。
+/// 只读到 request_body 为止的溢出页，不碰其后的 response_body
+fn fetch_request(conn: &Connection, id: i64) -> Result<Option<(StoredBody, Option<i64>, Option<i64>)>> {
+    conn.query_row(
+        "SELECT request_body, req_ref_id, req_prefix_len FROM messages WHERE id=?1",
+        params![id],
+        |row| {
+            Ok((
+                StoredBody::from_row(row, 0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        },
+    )
+    .optional()
+}
+
+/// 还原一条消息的完整请求体。
+///
+/// 增量行的 request_body 只是相对来源行（req_ref_id）请求体前 req_prefix_len 字节的
+/// 新增后缀：自本行向根回溯，逐层收集 (来源行, 前缀长度, 本层后缀)，再自根向叶
+/// 「截到前缀长度 + 接后缀」拼接。引用断裂（来源行已不在、数据损坏、长度对不上、
+/// 链过长）时不报错：正文以中文标记开头，其后是仍可还原的后缀部分
+fn resolve_request(
+    conn: &Connection,
+    req: &StoredBody,
+    ref_id: Option<i64>,
+    prefix_len: Option<i64>,
+) -> Result<String> {
+    // levels[0] 为本行所在层，依次向上；每项 (来源行 id, 前缀长度, 本层自有后缀)
+    let mut levels: Vec<(i64, usize, Vec<u8>)> = Vec::new();
+    let mut cur = req.decode();
+    let mut cur_ref = (ref_id, prefix_len);
+    // 断裂说明（None = 链完整）
+    let mut note: Option<String> = None;
+    // 根行（整条存储）的完整请求体
+    let mut root: Option<Vec<u8>> = None;
+    while root.is_none() {
+        let own = match std::mem::replace(&mut cur, Ok(Vec::new())) {
+            Ok(b) => b,
+            Err(e) => {
+                note = Some(format!("…[{e}]\n"));
+                break;
+            }
+        };
+        match cur_ref {
+            (None, _) => root = Some(own),
+            (Some(pid), plen) => {
+                let plen = plen.unwrap_or(0).max(0) as usize;
+                levels.push((pid, plen, own));
+                if levels.len() > MAX_REF_HOPS {
+                    note = Some(format!(
+                        "…[引用链过长（超过 {MAX_REF_HOPS} 层），前 {plen} 字节不可用]\n"
+                    ));
+                    break;
+                }
+                match fetch_request(conn, pid)? {
+                    Some((body, r, p)) => {
+                        cur = body.decode();
+                        cur_ref = (r, p);
+                    }
+                    None => {
+                        note = Some(format!(
+                            "…[引用的请求体 #{pid} 已不存在，前 {plen} 字节无法恢复]\n"
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // 自根向叶拼接；断裂时 acc 从空开始，能还原多少后缀就给多少
+    let mut acc = root.unwrap_or_default();
+    for &(pid, plen, ref suffix) in levels.iter().rev() {
+        if note.is_none() && plen > acc.len() {
+            note = Some(format!(
+                "…[引用的请求体 #{pid} 比记录的前缀长度短，前 {plen} 字节不完整]\n"
+            ));
+        }
+        acc.truncate(plen.min(acc.len()));
+        acc.extend_from_slice(suffix);
+    }
+    let mut out = String::new();
+    if let Some(n) = note {
+        out.push_str(&n);
+    }
+    out.push_str(&String::from_utf8_lossy(&acc));
+    Ok(out)
+}
+
+fn to_message_row(conn: &Connection, raw: RawMessage) -> Result<MessageRow> {
+    let RawMessage {
+        id,
+        aggregator_id,
+        plan_id,
+        method,
+        path,
+        status,
+        request_body,
+        response_body,
+        model,
+        prompt_tokens,
+        completion_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        total_tokens,
+        duration_ms,
+        created_at,
+        aggregator_name,
+        plan_name,
+        req_ref_id,
+        req_prefix_len,
+    } = raw;
+    Ok(MessageRow {
+        id,
+        aggregator_id,
+        plan_id,
+        method,
+        path,
+        status,
+        request_body: resolve_request(conn, &request_body, req_ref_id, req_prefix_len)?,
+        response_body: response_body.to_text(),
+        model,
+        prompt_tokens,
+        completion_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        total_tokens,
+        duration_ms,
+        created_at,
+        aggregator_name,
+        plan_name,
     })
 }
 
@@ -1028,23 +1257,48 @@ fn row_to_summary(row: &rusqlite::Row) -> Result<MessageSummary> {
 }
 
 /// 落库消息，返回 (行 id, 落库时间串)。created_at 是记录最后一列（在两个大 body
-/// 之后），回读它同样要遍历溢出页链，故随返回值带出供调用方构造事件摘要
-pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<(i64, String)> {
+/// 之后），回读它同样要遍历溢出页链，故随返回值带出供调用方构造事件摘要。
+///
+/// 两个 body 按 body 模块的格式编码后落库；请求体相对近期同聚合器的请求体只存
+/// 新增后缀（前缀增量）。store 是近期请求体缓存，须在持有数据库锁期间调用，
+/// 锁序恒为 DB → store
+pub fn insert_message(
+    conn: &Connection,
+    msg: &NewMessage,
+    store: &BodyStore,
+) -> Result<(i64, String)> {
     let created = now_str();
+    let req = msg.request_body.as_bytes();
+    let mut enc = body::Encoder::new(body::ONLINE_LEVEL);
+    // 来源行落库前再确认仍在库中（与清空消息同处持锁区间，正常不会落空）
+    let mut depth = 0;
+    let (req_blob, ref_id, prefix_len) = match store.plan_delta(msg.aggregator_id, req) {
+        Some(d) if ref_exists(conn, d.ref_id, msg.aggregator_id)? => {
+            depth = d.depth;
+            (
+                enc.encode(&req[d.prefix_len..]),
+                Some(d.ref_id),
+                Some(d.prefix_len as i64),
+            )
+        }
+        _ => (enc.encode(req), None, None),
+    };
+    let resp_blob = enc.encode(msg.response_body.as_bytes());
     conn.execute(
         "INSERT INTO messages (aggregator_id, plan_id, method, path, status, request_body,
                                response_body, model, prompt_tokens, completion_tokens,
                                cache_read_tokens, cache_creation_tokens,
-                               total_tokens, duration_ms, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                               total_tokens, duration_ms, created_at,
+                               req_ref_id, req_prefix_len)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
         params![
             msg.aggregator_id,
             msg.plan_id,
             msg.method,
             msg.path,
             msg.status,
-            msg.request_body,
-            msg.response_body,
+            req_blob,
+            resp_blob,
             msg.model,
             msg.prompt_tokens,
             msg.completion_tokens,
@@ -1052,10 +1306,27 @@ pub fn insert_message(conn: &Connection, msg: &NewMessage) -> Result<(i64, Strin
             msg.cache_creation_tokens,
             msg.total_tokens,
             msg.duration_ms,
-            &created
+            &created,
+            ref_id,
+            prefix_len
         ],
     )?;
-    Ok((conn.last_insert_rowid(), created))
+    let id = conn.last_insert_rowid();
+    store.push(msg.aggregator_id, id, Arc::from(req), depth);
+    Ok((id, created))
+}
+
+/// 引用来源行是否仍在库中且属于同一聚合器。引用只在同聚合器内建立，
+/// 因此按聚合器清空消息删掉的一定是完整的引用闭包
+fn ref_exists(conn: &Connection, id: i64, aggregator_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM messages WHERE id=?1 AND aggregator_id=?2",
+            params![id, aggregator_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// 点查聚合器/计划名（两表主键查找、小表开销为零），供事件摘要构造冗余展示名；
@@ -1095,7 +1366,11 @@ pub fn get_message(conn: &Connection, id: i64) -> Result<Option<MessageRow>> {
          LEFT JOIN coding_plans p ON p.id = m.plan_id
          WHERE m.id=?1"
     );
-    conn.query_row(&sql, params![id], row_to_message).optional()
+    match conn.query_row(&sql, params![id], row_to_raw).optional()? {
+        // 引用链回溯另发点查，不能在JOIN语句的行借用内进行
+        Some(raw) => to_message_row(conn, raw).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// 分页列出消息（按 id 倒序，不含请求/响应体），返回 (总数, 本页数据)
@@ -1137,10 +1412,205 @@ pub fn list_messages(
     Ok((total, items))
 }
 
-pub fn clear_messages(conn: &Connection, aggregator_id: Option<i64>) -> Result<usize> {
+/// 清空消息。引用只在同聚合器内建立，所以按聚合器清空删掉的一定是完整的引用闭包，
+/// 幸存行不需要改写。store 是近期请求体缓存：须与 DELETE 同处持锁区间一并清理，
+/// 否则被删的行还可能被新行选作前缀来源
+pub fn clear_messages(
+    conn: &Connection,
+    aggregator_id: Option<i64>,
+    store: &BodyStore,
+) -> Result<usize> {
+    let n = match aggregator_id {
+        Some(id) => conn.execute("DELETE FROM messages WHERE aggregator_id=?1", params![id])?,
+        None => conn.execute("DELETE FROM messages", [])?,
+    };
     match aggregator_id {
-        Some(id) => Ok(conn.execute("DELETE FROM messages WHERE aggregator_id=?1", params![id])?),
-        None => Ok(conn.execute("DELETE FROM messages", [])?),
+        Some(id) => store.remove_aggregator(id),
+        None => store.clear(),
+    }
+    Ok(n)
+}
+
+/// 游标之后是否还有未压缩（明文）行：走 idx_messages_legacy，O(1)
+pub fn has_legacy_rows(conn: &Connection, after_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM messages WHERE id > ?1 AND typeof(request_body)='text' LIMIT 1",
+            params![after_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// 未压缩（明文）行数：只数 idx_messages_legacy 的索引项，不碰大表
+pub fn legacy_message_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE typeof(request_body)='text'",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+// ---------------------------------------------------------------------------
+// 存储：页级统计 / 历史消息回填压缩 / 文件整理
+// ---------------------------------------------------------------------------
+
+/// 库文件的页级统计。各项都读文件头或数部分索引，不扫表
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageStats {
+    pub page_size: i64,
+    pub page_count: i64,
+    /// 空闲页数：回填压缩把行改小、或删除消息后留下的页，VACUUM 前不计入有效数据
+    pub freelist_count: i64,
+    /// 仍为明文（未压缩）的消息行数
+    pub legacy_rows: i64,
+}
+
+impl StorageStats {
+    /// 库文件字节数
+    pub fn file_bytes(&self) -> i64 {
+        self.page_size * self.page_count
+    }
+
+    /// 可回收字节数（空闲页）
+    pub fn reclaimable_bytes(&self) -> i64 {
+        self.page_size * self.freelist_count
+    }
+}
+
+pub fn storage_stats(conn: &Connection) -> Result<StorageStats> {
+    let pragma = |name: &str| -> Result<i64> {
+        Ok(conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get::<_, i64>(0))?)
+    };
+    Ok(StorageStats {
+        page_size: pragma("page_size")?,
+        page_count: pragma("page_count")?,
+        freelist_count: pragma("freelist_count")?,
+        legacy_rows: legacy_message_count(conn)?,
+    })
+}
+
+/// 一批回填压缩的结果。cursor 按 id 单调推进，重复调用直到 finished
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompressStep {
+    /// 本批处理到的最后一行 id（下一批从它之后继续；本批无行则原样返回）
+    pub cursor: i64,
+    /// 本批处理的行数
+    pub rows: usize,
+    /// 本批处理前 / 后的请求体+响应体字节数
+    pub bytes_in: usize,
+    pub bytes_out: usize,
+    /// cursor 之后已没有明文行
+    pub finished: bool,
+}
+
+/// 回填一批历史消息：把请求体仍为明文（TEXT，旧库写入）的行改写为编码存储，
+/// 规则与在线落库一致（前缀增量 + zstd），对消息内容无损。
+///
+/// - 按 id 升序每次最多 max_rows 行、约 max_bytes 字节（至少一行），保证单次持锁
+///   时间有界；须在持有数据库锁期间调用。
+/// - 整批一个事务：中途出错整体回滚，这些行仍是明文，可续跑；已处理的行不再是
+///   TEXT，不会被二次处理（幂等）。
+/// - cache 是跨批保留的近期请求体缓存（任务私有）；来源行写入前仍逐个确认在库中，
+///   批间被清空的消息不会被引用。
+/// - level 为压缩级别：回填不在请求路径上，用高于在线的级别换更小体积
+pub fn compress_batch(
+    conn: &Connection,
+    cursor: i64,
+    max_rows: usize,
+    max_bytes: usize,
+    level: i32,
+    cache: &BodyStore,
+) -> Result<CompressStep> {
+    let tx = conn.unchecked_transaction()?;
+    let mut step = CompressStep {
+        cursor,
+        ..Default::default()
+    };
+    let mut enc = body::Encoder::new(level);
+    // 先读完一批再写：UPDATE 会让行离开正在扫描的部分索引，不在扫描途中做
+    let mut pending: Vec<(i64, Vec<u8>, Option<i64>, Option<i64>, Vec<u8>)> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, aggregator_id, octet_length(request_body), octet_length(response_body),
+                    request_body, response_body
+             FROM messages WHERE id > ?1 AND typeof(request_body)='text'
+             ORDER BY id LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![cursor, max_rows.max(1) as i64])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let aggregator_id: i64 = row.get(1)?;
+            let row_bytes = (row.get::<_, i64>(2)? + row.get::<_, i64>(3)?) as usize;
+            // 至少处理一行，否则游标推不动、任务无法前进
+            if !pending.is_empty() && step.bytes_in + row_bytes > max_bytes {
+                break;
+            }
+            let req = StoredBody::from_row(row, 4)?;
+            let resp = StoredBody::from_row(row, 5)?;
+            step.bytes_in += req.bytes.len() + resp.bytes.len();
+
+            let body = req.bytes.as_slice();
+            let mut depth = 0;
+            let (req_blob, ref_id, prefix_len) = match cache.plan_delta(aggregator_id, body) {
+                Some(d) if ref_exists(&tx, d.ref_id, aggregator_id)? => {
+                    depth = d.depth;
+                    (
+                        enc.encode(&body[d.prefix_len..]),
+                        Some(d.ref_id),
+                        Some(d.prefix_len as i64),
+                    )
+                }
+                _ => (enc.encode(body), None, None),
+            };
+            let resp_blob = enc.encode(&resp.bytes);
+            step.bytes_out += req_blob.len() + resp_blob.len();
+            pending.push((id, req_blob, ref_id, prefix_len, resp_blob));
+            cache.push(aggregator_id, id, Arc::from(body), depth);
+            step.cursor = id;
+            step.rows += 1;
+        }
+    }
+    for (id, req_blob, ref_id, prefix_len, resp_blob) in &pending {
+        tx.execute(
+            "UPDATE messages SET request_body=?1, response_body=?2, req_ref_id=?3, req_prefix_len=?4
+             WHERE id=?5 AND typeof(request_body)='text'",
+            params![req_blob, resp_blob, ref_id, prefix_len, id],
+        )?;
+    }
+    tx.commit()?;
+    step.finished = !has_legacy_rows(conn, step.cursor)?;
+    Ok(step)
+}
+
+/// 整理库文件（VACUUM）：把空闲页还给文件系统。全库重写，耗时与库体积成正比，
+/// 期间独占连接，调用方须保证此时没有代理在用库。
+///
+/// cancel 置位则中断：VACUUM 是原子的，中断后库保持原样，返回 Ok(false)。
+/// check_every 是进度回调的 VM 指令间隔（仅测试调小）。
+///
+/// temp_store 必须临时改为 FILE：本连接常态是 MEMORY，而 VACUUM 的临时库（整库副本）
+/// 同受 temp_store 支配，不改会把整个新库放进内存。任何出口都恢复原设置
+pub fn vacuum(conn: &Connection, cancel: Arc<AtomicBool>, check_every: i32) -> Result<bool> {
+    conn.execute_batch("PRAGMA temp_store=FILE")?;
+    let flag = Arc::clone(&cancel);
+    conn.progress_handler(check_every, Some(move || flag.load(Ordering::Relaxed)));
+    let result = conn.execute_batch("VACUUM");
+    // 先摘回调：收 WAL 时取消标志可能仍置位
+    conn.progress_handler(0, None::<fn() -> bool>);
+    // 无论成败都恢复 temp_store、收一次 WAL（中断的 VACUUM 回滚后 WAL 仍可能很大）。
+    // 这两步失败不改变 VACUUM 的成败结论，不向上抛
+    let _ = conn.execute_batch("PRAGMA temp_store=MEMORY");
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    match result {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1248,6 +1718,7 @@ mod tests {
                 total_tokens: 3,
                 duration_ms: 10,
             },
+            &BodyStore::new(),
         )
         .unwrap();
 
@@ -1323,6 +1794,7 @@ mod tests {
                     total_tokens: 75,
                     duration_ms: 3,
                 },
+                &BodyStore::new(),
             )
             .unwrap();
         }
@@ -1343,7 +1815,7 @@ mod tests {
         let s = global_stats(&conn).unwrap();
         assert_eq!(s.total_tokens, 375);
 
-        assert_eq!(clear_messages(&conn, Some(agg.id)).unwrap(), 5);
+        assert_eq!(clear_messages(&conn, Some(agg.id), &BodyStore::new()).unwrap(), 5);
         assert_eq!(global_stats(&conn).unwrap().requests, 0);
     }
 
@@ -1400,7 +1872,9 @@ mod tests {
             CREATE TABLE aggregators (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, port INTEGER NOT NULL,
                 auth_token TEXT NOT NULL, strategy TEXT NOT NULL DEFAULT 'threshold_rotation',
-                token_threshold INTEGER NOT NULL DEFAULT 1000000, created_at TEXT NOT NULL);",
+                token_threshold INTEGER NOT NULL DEFAULT 1000000, created_at TEXT NOT NULL);
+            INSERT INTO messages (aggregator_id, request_body, response_body, created_at)
+                VALUES (1, 'legacy 请求体', 'legacy 响应体', '2026-01-01 00:00:00');",
         )
         .unwrap();
 
@@ -1418,9 +1892,17 @@ mod tests {
             v
         };
         let msg = cols("messages");
-        for c in ["model", "cache_read_tokens", "cache_creation_tokens"] {
+        for c in [
+            "model",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+            "req_ref_id",
+            "req_prefix_len",
+        ] {
             assert!(msg.iter().any(|x| x == c), "迁移后 messages 应有列 {c}");
         }
+        // 引用两列追加在末尾（与新建表的列序一致，MSG_COLS 按此取列）
+        assert_eq!(msg.last().unwrap(), "req_prefix_len");
         for (name, _) in STAT_INDEX_DDL {
             let exists = conn
                 .query_row(
@@ -1433,6 +1915,13 @@ mod tests {
                 .is_some();
             assert!(exists, "统计索引 {name} 应已建成");
         }
+        // 未压缩行部分索引已建，既有明文行被收录且照常可读
+        let plan = plan_of(&conn, "SELECT COUNT(*) FROM messages WHERE typeof(request_body)='text'");
+        assert!(plan.contains("idx_messages_legacy"), "{plan}");
+        assert_eq!(legacy_message_count(&conn).unwrap(), 1);
+        let m = get_message(&conn, 1).unwrap().unwrap();
+        assert_eq!(m.request_body, "legacy 请求体");
+        assert_eq!(m.response_body, "legacy 响应体");
     }
 
     /// 回归防线：统计查询必须命中覆盖索引（idx_messages_stat_*），
@@ -1463,6 +1952,7 @@ mod tests {
                     total_tokens: 75,
                     duration_ms: 3,
                 },
+                &BodyStore::new(),
             )
             .unwrap();
         }
@@ -1545,6 +2035,7 @@ mod tests {
                     total_tokens: total,
                     duration_ms: 1,
                 },
+                &BodyStore::new(),
             )
             .unwrap();
             if let Some(c) = created {
@@ -1613,6 +2104,7 @@ mod tests {
                     total_tokens: total,
                     duration_ms: 1,
                 },
+                &BodyStore::new(),
             )
             .unwrap();
             conn.execute(
@@ -1744,7 +2236,7 @@ mod tests {
             )
         };
         let insert_at = |m: NewMessage, created: String| {
-            insert_message(&conn, &m).unwrap();
+            insert_message(&conn, &m, &BodyStore::new()).unwrap();
             conn.execute(
                 "UPDATE messages SET created_at=?1 WHERE id=(SELECT MAX(id) FROM messages)",
                 params![created],
@@ -1895,5 +2387,532 @@ mod tests {
         let got = get_aggregator(&conn, agg.id).unwrap().unwrap();
         assert_eq!(got.current_plan_id, None, "清除后恢复自动轮转");
         let _ = p2;
+    }
+
+    // -----------------------------------------------------------------------
+    // 消息体编码存储：写入 / 读取 / 清空 / 回填
+    // -----------------------------------------------------------------------
+
+    /// EXPLAIN QUERY PLAN 的明细行
+    fn plan_of(conn: &Connection, sql: &str) -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap()
+            .join(" | ")
+    }
+
+    fn new_msg(aggregator_id: i64, req: &str, resp: &str) -> NewMessage {
+        NewMessage {
+            aggregator_id,
+            plan_id: None,
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            status: 200,
+            request_body: req.into(),
+            response_body: resp.into(),
+            model: "glm-4.7".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            total_tokens: 2,
+            duration_ms: 1,
+        }
+    }
+
+    /// 旧库形态的明文行：绕过 insert_message，以 TEXT 原样落库
+    fn insert_legacy(conn: &Connection, aggregator_id: i64, req: &str, resp: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO messages (aggregator_id, method, path, request_body, response_body,
+                                   model, total_tokens, duration_ms, created_at)
+             VALUES (?1,'POST','/v1/messages',?2,?3,'glm-4.7',1,1,'2026-01-01 00:00:00')",
+            params![aggregator_id, req, resp],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// 可压缩的伪正文（字母循环），seed 决定相位：不同 seed 的正文首字节即不同
+    fn filler(len: usize, seed: u8) -> String {
+        (0..len)
+            .map(|i| (b'a' + ((i as u8).wrapping_mul(7).wrapping_add(seed)) % 26) as char)
+            .collect()
+    }
+
+    /// 一行的请求体引用 (req_ref_id, req_prefix_len)
+    fn req_ref(conn: &Connection, id: i64) -> (Option<i64>, Option<i64>) {
+        conn.query_row(
+            "SELECT req_ref_id, req_prefix_len FROM messages WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    /// 全部消息的请求体+响应体落库字节数
+    fn stored_bytes(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COALESCE(SUM(octet_length(request_body) + octet_length(response_body)),0)
+             FROM messages",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// 断言全部行的请求体引用都指向同一聚合器的更早行（引用闭包不变量）
+    fn assert_refs_closed(conn: &Connection) -> usize {
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, m.req_ref_id FROM messages m
+                 LEFT JOIN messages p ON p.id = m.req_ref_id
+                 WHERE m.req_ref_id IS NOT NULL
+                   AND (p.id IS NULL OR p.aggregator_id <> m.aggregator_id OR p.id >= m.id)",
+            )
+            .unwrap();
+        let broken = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(broken.is_empty(), "这些行的引用越出了同聚合器的更早行：{broken:?}");
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE req_ref_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn insert_and_get_message_roundtrip_blob_vs_legacy() {
+        let conn = mem();
+        let agg =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let store = BodyStore::new();
+        let long = filler(100_000, 0);
+        let bodies = ["req", "", "{}", long.as_str()];
+        let ids: Vec<i64> = bodies
+            .iter()
+            .map(|req| insert_message(&conn, &new_msg(agg.id, req, "resp"), &store).unwrap().0)
+            .collect();
+
+        // 新行一律 BLOB：极短的走原始字节（1 字节标签 + 原文）、空体为空 BLOB、
+        // 可压缩的走 zstd
+        for (id, req) in ids.iter().zip(bodies) {
+            let (kind, len): (String, i64) = conn
+                .query_row(
+                    "SELECT typeof(request_body), octet_length(request_body) FROM messages WHERE id=?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(kind, "blob");
+            if req.is_empty() {
+                assert_eq!(len, 0);
+            } else if req.len() < 16 {
+                assert_eq!(len, req.len() as i64 + 1);
+            } else {
+                assert!(len * 2 < req.len() as i64, "压缩后应显著变小：{len}");
+            }
+        }
+        for (id, req) in ids.iter().zip(bodies) {
+            let m = get_message(&conn, *id).unwrap().unwrap();
+            assert_eq!(m.request_body, req);
+            assert_eq!(m.response_body, "resp");
+            assert_eq!(req_ref(&conn, *id).0, None, "不足 16KB 的体不建增量");
+        }
+
+        // 旧库明文行（TEXT）照常读出，且只把明文行算作未压缩
+        let legacy = insert_legacy(&conn, agg.id, "legacy 请求体", "legacy 响应体");
+        let m = get_message(&conn, legacy).unwrap().unwrap();
+        assert_eq!(m.request_body, "legacy 请求体");
+        assert_eq!(m.response_body, "legacy 响应体");
+        assert_eq!(legacy_message_count(&conn).unwrap(), 1);
+        assert!(has_legacy_rows(&conn, 0).unwrap());
+        assert!(!has_legacy_rows(&conn, legacy).unwrap());
+        assert!(get_message(&conn, legacy + 100).unwrap().is_none());
+    }
+
+    /// 回归防线：未压缩行的判断/计数/回填扫描必须命中部分索引，
+    /// 否则在数十 GB 的库上退化为遍历溢出页链的全表扫描
+    #[test]
+    fn legacy_queries_use_partial_index() {
+        let conn = mem();
+        let agg =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        for i in 0..5 {
+            insert_legacy(&conn, agg.id, &format!("r{i}"), "p");
+        }
+        for sql in [
+            "SELECT COUNT(*) FROM messages WHERE typeof(request_body)='text'",
+            "SELECT 1 FROM messages WHERE id > 3 AND typeof(request_body)='text' LIMIT 1",
+            "SELECT id FROM messages WHERE id > 3 AND typeof(request_body)='text' ORDER BY id LIMIT 8",
+        ] {
+            let plan = plan_of(&conn, sql);
+            assert!(plan.contains("idx_messages_legacy"), "{sql} -> {plan}");
+        }
+    }
+
+    #[test]
+    fn get_message_chain_roundtrip() {
+        let conn = mem();
+        let a1 =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let a2 =
+            create_aggregator(&conn, "g2", 8301, "cpm-y", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let store = BodyStore::new();
+        // 两个聚合器各有一条逐轮增长的会话，行交错落库
+        let sys1 = filler(64 * 1024, 0);
+        let sys2 = filler(64 * 1024, 1);
+        let mut expected = Vec::new();
+        for turn in 0..6 {
+            for (agg, sys) in [(&a1, &sys1), (&a2, &sys2)] {
+                let req = format!("{sys}\n[turn {turn}]{}", "对话内容".repeat(200));
+                let id = insert_message(&conn, &new_msg(agg.id, &req, "r"), &store)
+                    .unwrap()
+                    .0;
+                expected.push((id, req));
+            }
+        }
+        for (id, req) in &expected {
+            assert_eq!(get_message(&conn, *id).unwrap().unwrap().request_body, *req);
+        }
+        // 每个聚合器首行整条，其后均为增量
+        let roots = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE req_ref_id IS NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(roots, 2);
+        assert_eq!(assert_refs_closed(&conn), expected.len() - 2);
+    }
+
+    #[test]
+    fn get_message_degrades_on_dangling_ref() {
+        let conn = mem();
+        let agg =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let store = BodyStore::new();
+        let sys = filler(64 * 1024, 0);
+        let id = |suffix: &str| {
+            insert_message(&conn, &new_msg(agg.id, &format!("{sys} {suffix}"), "r"), &store)
+                .unwrap()
+                .0
+        };
+        let root = id("root");
+        let child = id("child");
+        let grand = id("childgrand");
+        // 公共前缀：root/child 到 " " 为止；child/grand 到 " child" 为止
+        let prefix = (sys.len() + 1) as i64;
+        assert_eq!(req_ref(&conn, child), (Some(root), Some(prefix)));
+        assert_eq!(req_ref(&conn, grand), (Some(child), Some(prefix + 5)));
+
+        // 来源行比记录的前缀长度短（标记点名直接来源行；正文不报错，
+        // 为「来源行全文 + 自有后缀」）。改回正确长度即恢复
+        let great = id("childgrand2");
+        assert_eq!(req_ref(&conn, great), (Some(grand), Some(prefix + 10)));
+        let full = format!("{sys} childgrand2");
+        assert_eq!(get_message(&conn, great).unwrap().unwrap().request_body, full);
+        conn.execute(
+            "UPDATE messages SET req_prefix_len=999999 WHERE id=?1",
+            params![great],
+        )
+        .unwrap();
+        let m = get_message(&conn, great).unwrap().unwrap().request_body;
+        assert_eq!(
+            m,
+            format!(
+                "…[引用的请求体 #{grand} 比记录的前缀长度短，前 999999 字节不完整]\n{full}"
+            )
+        );
+        conn.execute(
+            "UPDATE messages SET req_prefix_len=?2 WHERE id=?1",
+            params![great, prefix + 10],
+        )
+        .unwrap();
+        assert_eq!(get_message(&conn, great).unwrap().unwrap().request_body, full);
+
+        // 根行不在了（正常路径不会发生——按聚合器清空删的是完整闭包；
+        // 此处模拟库被异常改动）：不报错，以标记开头 + 仍可还原的后缀
+        conn.execute("DELETE FROM messages WHERE id=?1", params![root])
+            .unwrap();
+        let gone = format!("…[引用的请求体 #{root} 已不存在，前 {prefix} 字节无法恢复]\n");
+        assert_eq!(
+            get_message(&conn, great).unwrap().unwrap().request_body,
+            format!("{gone}childgrand2"),
+            "多层同断一个断点：标记只出一次，各层后缀依次拼上"
+        );
+        assert_eq!(
+            get_message(&conn, child).unwrap().unwrap().request_body,
+            format!("{gone}child")
+        );
+
+        // 数据损坏：解码错误出现在正文标记里，详情其余字段照常
+        conn.execute(
+            "UPDATE messages SET request_body=X'7F00', response_body=X'0105' WHERE id=?1",
+            params![child],
+        )
+        .unwrap();
+        let m = get_message(&conn, child).unwrap().unwrap();
+        assert!(m.request_body.starts_with("…[请求/响应体数据损坏：未知编码标签 0x7f]"));
+        assert!(m.response_body.starts_with("…[请求/响应体数据损坏：缺少长度前缀]"));
+        assert_eq!(m.status, 200);
+
+        // 引用成环：跳数到顶即停，不会死循环
+        let a = id("cycle-a");
+        let b = id("cycle-b");
+        conn.execute("UPDATE messages SET req_ref_id=?2 WHERE id=?1", params![a, b])
+            .unwrap();
+        conn.execute(
+            "UPDATE messages SET req_ref_id=?2, req_prefix_len=100 WHERE id=?1",
+            params![b, a],
+        )
+        .unwrap();
+        let m = get_message(&conn, b).unwrap().unwrap().request_body;
+        assert!(m.starts_with("…[引用链过长（超过 256 层）"), "{m}");
+    }
+
+    #[test]
+    fn clear_messages_keeps_refs_closed() {
+        let conn = mem();
+        let a1 =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let a2 =
+            create_aggregator(&conn, "g2", 8301, "cpm-y", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let store = BodyStore::new();
+        let sys1 = filler(64 * 1024, 0);
+        let sys2 = filler(64 * 1024, 1);
+        let mut kept = Vec::new();
+        for turn in 0..4 {
+            for (agg, sys) in [(&a1, &sys1), (&a2, &sys2)] {
+                let req = format!("{sys} [turn {turn}]{}", "内容".repeat(500));
+                let id = insert_message(&conn, &new_msg(agg.id, &req, "r"), &store)
+                    .unwrap()
+                    .0;
+                if agg.id == a2.id {
+                    kept.push((id, req));
+                }
+            }
+        }
+        assert_eq!(assert_refs_closed(&conn), 6);
+
+        // 按聚合器清空：删掉的是完整引用闭包，另一聚合器的详情不受影响
+        assert_eq!(clear_messages(&conn, Some(a1.id), &store).unwrap(), 4);
+        for (id, req) in &kept {
+            assert_eq!(get_message(&conn, *id).unwrap().unwrap().request_body, *req);
+        }
+        // 缓存随之清空：该聚合器之后的新行不会引用已删除的行
+        let req = format!("{sys1} after clear");
+        let id = insert_message(&conn, &new_msg(a1.id, &req, "r"), &store)
+            .unwrap()
+            .0;
+        assert_eq!(req_ref(&conn, id).0, None);
+        assert_eq!(get_message(&conn, id).unwrap().unwrap().request_body, req);
+
+        // 全部清空
+        assert_eq!(clear_messages(&conn, None, &store).unwrap(), kept.len() + 1);
+        assert_eq!(legacy_message_count(&conn).unwrap(), 0);
+        assert!(list_messages(&conn, None, 10, 0).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn compress_batch_lossless_idempotent() {
+        let conn = mem();
+        let a1 =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let a2 =
+            create_aggregator(&conn, "g2", 8301, "cpm-y", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        // 旧库明文行：逐轮增长的会话、完全重复的体、空体、带截断标记的体、多聚合器
+        let sys = filler(64 * 1024, 0);
+        let mut expected = Vec::new();
+        let mut add = |agg: i64, req: String, resp: String| {
+            let id = insert_legacy(&conn, agg, &req, &resp);
+            expected.push((id, req, resp));
+        };
+        for turn in 0..5 {
+            add(a1.id, format!("{sys}[turn {turn}]{}", "正文".repeat(300)), format!("resp {turn}"));
+        }
+        add(a1.id, format!("{sys}[turn 0]{}", "正文".repeat(300)), "dup".into());
+        add(a1.id, String::new(), String::new());
+        add(a1.id, "{\"a\":1}\n…[已截断]".into(), "x".repeat(50_000));
+        for turn in 0..3 {
+            add(a2.id, format!("{}[b {turn}]", filler(20 * 1024, 3)), "b".into());
+        }
+        let before = stored_bytes(&conn);
+        assert_eq!(legacy_message_count(&conn).unwrap(), expected.len() as i64);
+
+        // 字节预算小于单行：每批一行，多批跑完；中途可续跑（缓存跨批复用）
+        let cache = BodyStore::new();
+        let mut cursor = 0;
+        let (mut rows, mut bytes_in, mut bytes_out) = (0, 0, 0);
+        for _ in 0..100 {
+            let step = compress_batch(&conn, cursor, 3, 8 * 1024, 3, &cache).unwrap();
+            assert!(step.rows <= 3);
+            assert!(step.rows > 0, "未完成却没有进展");
+            rows += step.rows;
+            bytes_in += step.bytes_in;
+            bytes_out += step.bytes_out;
+            if step.finished {
+                break;
+            }
+            cursor = step.cursor;
+        }
+        assert_eq!(rows, expected.len());
+        assert_eq!(legacy_message_count(&conn).unwrap(), 0);
+        assert_eq!(bytes_in as i64, before);
+        assert_eq!(bytes_out as i64, stored_bytes(&conn));
+        assert!(bytes_out * 4 < before as usize, "压缩后应显著变小：{before} -> {bytes_out}");
+
+        // 无损：逐行与回填前逐字节一致
+        for (id, req, resp) in &expected {
+            let m = get_message(&conn, *id).unwrap().unwrap();
+            assert_eq!(&m.request_body, req, "消息 {id} 请求体");
+            assert_eq!(&m.response_body, resp, "消息 {id} 响应体");
+        }
+        // 全部改为 BLOB；会话行成为增量链，引用不越出同聚合器的更早行
+        let text_left = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE typeof(request_body) <> 'blob'
+                     OR typeof(response_body) <> 'blob'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(text_left, 0);
+        assert!(assert_refs_closed(&conn) >= 4);
+
+        // 幂等：再跑一遍无事可做，数据不变
+        let step = compress_batch(&conn, 0, 100, 1 << 30, 3, &BodyStore::new()).unwrap();
+        assert_eq!(
+            step,
+            CompressStep {
+                cursor: 0,
+                rows: 0,
+                bytes_in: 0,
+                bytes_out: 0,
+                finished: true
+            }
+        );
+        for (id, req, resp) in &expected {
+            let m = get_message(&conn, *id).unwrap().unwrap();
+            assert_eq!(&m.request_body, req);
+            assert_eq!(&m.response_body, resp);
+        }
+    }
+
+    #[test]
+    fn compress_batch_verifies_source_row_exists() {
+        // 回填缓存跨批保留：批间被删掉的行仍在缓存里，下一批可能选中它——
+        // 落库前确认来源行还在，不在就存整条
+        let conn = mem();
+        let agg =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let sys = filler(64 * 1024, 0);
+        let p = insert_legacy(&conn, agg.id, &format!("{sys} P"), "r");
+        let q = insert_legacy(&conn, agg.id, &format!("{sys} Q"), "r");
+
+        let cache = BodyStore::new();
+        let step = compress_batch(&conn, 0, 1, 1 << 30, 3, &cache).unwrap();
+        assert_eq!((step.rows, step.cursor, step.finished), (1, p, false));
+        assert_eq!(req_ref(&conn, p).0, None);
+        conn.execute("DELETE FROM messages WHERE id=?1", params![p]).unwrap();
+
+        let step = compress_batch(&conn, step.cursor, 100, 1 << 30, 3, &cache).unwrap();
+        assert!(step.finished);
+        assert_eq!(req_ref(&conn, q).0, None);
+        assert_eq!(
+            get_message(&conn, q).unwrap().unwrap().request_body,
+            format!("{sys} Q")
+        );
+    }
+
+    #[test]
+    fn storage_stats_reports_freelist() {
+        let conn = mem();
+        let agg =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let big = filler(200 * 1024, 0);
+        for i in 0..4 {
+            insert_legacy(&conn, agg.id, &format!("{big}{i}"), &"x".repeat(50_000));
+        }
+        let s = storage_stats(&conn).unwrap();
+        assert_eq!(s.page_size, 4096);
+        assert_eq!(s.legacy_rows, 4);
+        assert_eq!(s.freelist_count, 0);
+        assert_eq!(s.reclaimable_bytes(), 0);
+        let file = s.file_bytes();
+        assert!(file > 800_000, "四个 250KB 的明文行应占约 1MB：{file}");
+
+        // 回填把行改小：腾出的页进空闲表，整理（VACUUM）前文件不会自己变小
+        let step = compress_batch(&conn, 0, 100, 1 << 30, 3, &BodyStore::new()).unwrap();
+        assert!(step.finished);
+        let s = storage_stats(&conn).unwrap();
+        assert_eq!(s.legacy_rows, 0);
+        assert!(s.file_bytes() >= file);
+        assert!(
+            s.reclaimable_bytes() > file / 2,
+            "大部分页应已空闲：可回收 {} / {file}",
+            s.reclaimable_bytes()
+        );
+    }
+
+    /// 整理途中被取消：SQLite 原子回滚，页统计与内容不变、temp_store 复原；
+    /// 之后正常整理才把空闲页还给文件
+    #[test]
+    fn vacuum_interrupted_midway_keeps_db_intact() {
+        let conn = mem();
+        let agg =
+            create_aggregator(&conn, "g1", 8300, "cpm-x", 100, STRATEGY_THRESHOLD_ROTATION)
+                .unwrap();
+        let big = filler(200 * 1024, 0);
+        let mut rows = Vec::new();
+        for i in 0..6 {
+            let req = format!("{big}{i}");
+            let id = insert_legacy(&conn, agg.id, &req, "p");
+            rows.push((id, req));
+        }
+        compress_batch(&conn, 0, 100, 1 << 30, 3, &BodyStore::new()).unwrap();
+        let before = storage_stats(&conn).unwrap();
+        let total = list_messages(&conn, None, 100, 0).unwrap().0;
+
+        // 标志已置位 + 回调间隔最小：VACUUM 一开始即被打断
+        assert!(!vacuum(&conn, Arc::new(AtomicBool::new(true)), 1).unwrap());
+
+        assert_eq!(storage_stats(&conn).unwrap(), before, "中断的 VACUUM 不改变页统计");
+        assert_eq!(list_messages(&conn, None, 100, 0).unwrap().0, total);
+        for (id, req) in &rows {
+            assert_eq!(get_message(&conn, *id).unwrap().unwrap().request_body, *req);
+        }
+        let temp_store: i64 = conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(temp_store, 2, "应恢复为 MEMORY");
+        let check: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+
+        assert!(vacuum(&conn, Arc::new(AtomicBool::new(false)), 50_000).unwrap());
+        let s = storage_stats(&conn).unwrap();
+        assert_eq!(s.freelist_count, 0);
+        assert!(s.file_bytes() < before.file_bytes());
+        assert_eq!(list_messages(&conn, None, 100, 0).unwrap().0, total);
     }
 }

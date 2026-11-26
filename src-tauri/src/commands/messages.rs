@@ -69,7 +69,8 @@ pub async fn clear_messages(
     state: tauri::State<'_, AppState>,
     aggregator_id: Option<i64>,
 ) -> Result<usize, String> {
-    run_db(&state, move |c| db::clear_messages(c, aggregator_id)).await
+    let bodies = state.bodies.clone();
+    run_db(&state, move |c| db::clear_messages(c, aggregator_id, &bodies)).await
 }
 
 #[tauri::command]
