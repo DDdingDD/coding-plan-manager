@@ -15,64 +15,6 @@
       </a-flex>
     </a-flex>
 
-    <a-card title="数据库" size="small" style="margin-bottom: 16px">
-      <a-spin :spinning="dbLoading && !dbInfo" size="small">
-        <a-alert
-          v-if="dbError"
-          :message="dbError"
-          type="warning"
-          show-icon
-          style="margin-bottom: 12px"
-        >
-          <template #action>
-            <a-button size="small" @click="loadDbInfo">重试</a-button>
-          </template>
-        </a-alert>
-
-        <template v-if="dbInfo">
-          <a-descriptions :column="2" size="small">
-            <a-descriptions-item label="数据库路径" :span="2">
-              <a-flex align="flex-start" :gap="4" class="db-path">
-                <a-typography-text code :title="dbInfo.db_path" class="db-path-text">
-                  {{ dbInfo.db_path }}
-                </a-typography-text>
-                <a-tooltip title="复制路径">
-                  <a-button
-                    type="text"
-                    size="small"
-                    class="db-copy"
-                    @click="copyText(dbInfo.db_path, '数据库路径已复制')"
-                  >
-                    <CopyOutlined />
-                  </a-button>
-                </a-tooltip>
-              </a-flex>
-            </a-descriptions-item>
-            <a-descriptions-item label="主库大小">
-              <a-tooltip :title="`${formatNumber(dbInfo.db_size)} 字节`">
-                <span>{{ formatBytes(dbInfo.db_size) }}</span>
-              </a-tooltip>
-            </a-descriptions-item>
-            <a-descriptions-item label="文件总大小">
-              <a-tooltip
-                :title="`${formatNumber(dbInfo.total_size)} 字节（主库 + WAL + SHM 文件长度之和）`"
-              >
-                <span>{{ formatBytes(dbInfo.total_size) }}</span>
-              </a-tooltip>
-            </a-descriptions-item>
-            <a-descriptions-item label="辅助文件" :span="2">
-              <a-typography-text type="secondary">
-                WAL {{ formatBytes(dbInfo.wal_size) }} · SHM {{ formatBytes(dbInfo.shm_size) }}
-              </a-typography-text>
-            </a-descriptions-item>
-          </a-descriptions>
-          <a-typography-text type="secondary" class="db-note">
-            文件总大小为主库、WAL、SHM 的文件长度之和，不代表文件系统实际分配空间。
-          </a-typography-text>
-        </template>
-      </a-spin>
-    </a-card>
-
     <a-card title="按天统计" size="small" style="margin-bottom: 16px">
       <template #extra>
         <a-radio-group v-model:value="days" size="small" @change="loadDaily">
@@ -159,34 +101,15 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { message } from "ant-design-vue";
-import { CopyOutlined } from "@ant-design/icons-vue";
 import dayjs, { type Dayjs } from "dayjs";
 import TokenBars, { type BarItem } from "../components/TokenBars.vue";
-import { dailyStats, getDbInfo, hourlyStats, listAggregators, modelStats, onNewMessage } from "../api";
-import type { DbInfo, StatsBucket } from "../types";
-import { copyText, debounce, formatBytes, formatNumber } from "../utils";
+import { dailyStats, hourlyStats, listAggregators, modelStats, onNewMessage } from "../api";
+import type { StatsBucket } from "../types";
+import { debounce, formatNumber } from "../utils";
 
 const aggOptions = ref<{ value: number; label: string }[]>([]);
 const filterAgg = ref<number | null>(null);
 const loading = ref(false);
-
-// ---- 数据库文件 ----
-const dbInfo = ref<DbInfo | null>(null);
-const dbLoading = ref(false);
-const dbError = ref("");
-
-async function loadDbInfo() {
-  dbLoading.value = true;
-  dbError.value = "";
-  try {
-    dbInfo.value = await getDbInfo();
-  } catch (e) {
-    // 自动刷新失败时保留旧数据，仅在卡片内提示，避免反复弹全局错误
-    dbError.value = String(e);
-  } finally {
-    dbLoading.value = false;
-  }
-}
 
 // ---- 按天 ----
 const days = ref(30);
@@ -304,7 +227,7 @@ async function loadModels() {
 
 function reloadAll() {
   loading.value = true;
-  Promise.all([loadDbInfo(), loadDaily(), loadHourly(), loadModels()]).finally(
+  Promise.all([loadDaily(), loadHourly(), loadModels()]).finally(
     () => (loading.value = false),
   );
 }
@@ -321,22 +244,6 @@ onUnmounted(() => unlisten?.());
 </script>
 
 <style scoped>
-.db-path {
-  min-width: 0;
-}
-.db-path-text {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  word-break: break-all;
-}
-.db-copy {
-  flex: none;
-}
-.db-note {
-  display: block;
-  margin-top: 8px;
-  font-size: 12px;
-}
 .legend {
   display: flex;
   gap: 16px;

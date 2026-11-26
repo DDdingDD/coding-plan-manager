@@ -4,10 +4,6 @@
       <div class="logo">Coding Plan Manager</div>
       <a-menu v-model:selectedKeys="current" mode="inline" :items="menuItems" />
       <div class="global-stats">
-        <div class="tray-setting">
-          <a-switch size="small" v-model:checked="hideOnClose" />
-          <span>关闭时隐藏到托盘</span>
-        </div>
         <a-statistic title="累计 Token" :value="stats.total_tokens" style="margin-bottom: 4px" />
         <a-statistic title="累计请求" :value="stats.requests" />
         <a-divider style="margin: 8px 0" />
@@ -18,6 +14,11 @@
       <PlansPage v-if="current[0] === 'plans'" />
       <AggregatorsPage v-else-if="current[0] === 'aggregators'" />
       <MessagesPage v-else-if="current[0] === 'messages'" />
+      <ConfigPage
+        v-else-if="current[0] === 'config'"
+        :hide-on-close="hideOnClose"
+        @update:hide-on-close="hideOnClose = $event"
+      />
       <StatsPage v-else />
     </a-layout-content>
   </a-layout>
@@ -30,6 +31,7 @@ import {
   BarChartOutlined,
   ClusterOutlined,
   MessageOutlined,
+  SettingOutlined,
 } from "@ant-design/icons-vue";
 import { Modal, message } from "ant-design-vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -37,6 +39,7 @@ import PlansPage from "./pages/PlansPage.vue";
 import AggregatorsPage from "./pages/AggregatorsPage.vue";
 import MessagesPage from "./pages/MessagesPage.vue";
 import StatsPage from "./pages/StatsPage.vue";
+import ConfigPage from "./pages/ConfigPage.vue";
 import TripGauge from "./components/TripGauge.vue";
 import { globalStats, onNewMessage, resetTrip, toggleTripPause, tripStats } from "./api";
 import { debounce } from "./utils";
@@ -64,6 +67,11 @@ const menuItems = [
     key: "stats",
     icon: () => h(BarChartOutlined),
     label: "统计",
+  },
+  {
+    key: "config",
+    icon: () => h(SettingOutlined),
+    label: "配置",
   },
 ];
 
@@ -162,14 +170,6 @@ body {
   bottom: 0;
   width: 200px;
   background: #fff;
-}
-.tray-setting {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 12px;
-  font-size: 12px;
-  color: #595959;
 }
 .trip-header {
   display: flex;
